@@ -24,7 +24,8 @@ typedef struct isyntax_cache_t {
 } isyntax_cache_t;
 
 // TODO(avirodov): can this ever fail?
-void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
+// Returns false if a codeblock needed for the tile could not be read or decoded (corrupt or truncated file).
+bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
                        uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format);
 
 void tile_list_init(isyntax_tile_list_t* list, const char* dbg_name);
