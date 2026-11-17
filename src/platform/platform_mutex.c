@@ -61,3 +61,37 @@ void platform_mutex_unlock(platform_mutex_t* mutex) {
 	pthread_mutex_unlock(&mutex->lock);
 #endif
 }
+
+void platform_condition_variable_init(platform_condition_variable_t* cond) {
+#ifdef _WIN32
+	InitializeConditionVariable(&cond->cond);
+#else
+	if (pthread_cond_init(&cond->cond, NULL) != 0) {
+		fatal_error("platform_condition_variable_init(): failed to initialize pthread condition variable");
+	}
+#endif
+}
+
+void platform_condition_variable_destroy(platform_condition_variable_t* cond) {
+#ifdef _WIN32
+	(void)cond;
+#else
+	pthread_cond_destroy(&cond->cond);
+#endif
+}
+
+void platform_condition_variable_wait(platform_condition_variable_t* cond, platform_mutex_t* mutex) {
+#ifdef _WIN32
+	SleepConditionVariableSRW(&cond->cond, &mutex->lock, INFINITE, 0);
+#else
+	pthread_cond_wait(&cond->cond, &mutex->lock);
+#endif
+}
+
+void platform_condition_variable_broadcast(platform_condition_variable_t* cond) {
+#ifdef _WIN32
+	WakeAllConditionVariable(&cond->cond);
+#else
+	pthread_cond_broadcast(&cond->cond);
+#endif
+}

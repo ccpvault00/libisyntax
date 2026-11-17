@@ -167,6 +167,12 @@ if(BUILD_TESTING)
         target_link_libraries(thread_test isyntax)
         add_test(NAME smoke_thread_test
                 COMMAND thread_test)
+
+        # Concurrent reads of one cache must give the same pixels as single-threaded reads.
+        add_executable(tile_read_hammer test/tile_read_hammer.c)
+        target_link_libraries(tile_read_hammer isyntax)
+        add_test(NAME tile_read_hammer
+                COMMAND tile_read_hammer ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/testslide.isyntax)
     endif()
 
     # Damaged copies of the test slide must come back with an error code, never abort or hang.

@@ -151,6 +151,14 @@ if get_option('tests')
       include_directories : [isyntax_includes],
     )
     test('smoke_thread_test', thread_test)
+
+    # Concurrent reads of one cache must give the same pixels as single-threaded reads.
+    tile_read_hammer = executable(
+      'tile_read_hammer',
+      'test/tile_read_hammer.c',
+      dependencies : [libisyntax_dep, threads],
+    )
+    test('tile_read_hammer', tile_read_hammer, args : [testslide], timeout : 600)
   endif
 
   # Damaged copies of the test slide must come back with an error code, never abort or hang.
