@@ -182,11 +182,20 @@ void destroy_thread_memory(void);
 
 extern THREAD_LOCAL thread_memory_t* threadlocal_thread_memory;
 extern THREAD_LOCAL i32 threadlocal_logical_thread_index;
-static inline temp_memory_t begin_temp_memory_on_local_thread() { return begin_temp_memory(&threadlocal_thread_memory->temp_arena); }
 
 extern int g_argc;
 extern const char** g_argv;
 extern system_info_t global_system_info;
+
+// Lazily set up the thread-local scratch arena for threads that libisyntax
+// did not create itself (e.g. arbitrary caller threads of OpenSlide or Python).
+// Without this, such threads dereference NULL here.
+static inline temp_memory_t begin_temp_memory_on_local_thread() {
+	if (threadlocal_thread_memory == NULL) {
+		init_thread_memory(&global_system_info);
+	}
+	return begin_temp_memory(&threadlocal_thread_memory->temp_arena);
+}
 
 extern bool is_verbose_mode INIT(= false);
 
