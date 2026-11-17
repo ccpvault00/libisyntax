@@ -56,9 +56,10 @@ void block_allocator_init(block_allocator_t* allocator, size_t block_size, size_
 	allocator->chunk_size = chunk_size;
 	ASSERT(chunk_count > 0);
 	allocator->chunk_count = chunk_count;
-	allocator->used_chunks = 1;
+	// The first chunk is allocated on first use: a handle that is opened but never read (or whose reads all hit
+	// the OS page cache of another process) should not reserve chunk_size (256 MB) per allocator up front.
+	allocator->used_chunks = 0;
 	allocator->chunks = calloc(1, chunk_count * sizeof(block_allocator_chunk_t));
-	allocator->chunks[0].memory = (u8*)malloc(chunk_size);
 	allocator->free_list_storage = calloc(1, max_capacity_in_blocks * sizeof(block_allocator_item_t));
     platform_mutex_init(&allocator->lock);
 	allocator->is_valid = true;
@@ -85,7 +86,10 @@ void* block_alloc(block_allocator_t* allocator) {
 		allocator->free_list = free_item->next;
 		--allocator->free_list_length;
 	} else {
-		ASSERT(allocator->used_chunks >= 1);
+		if (allocator->used_chunks == 0) {
+			allocator->used_chunks = 1;
+			allocator->chunks[0].memory = (u8*)malloc(allocator->chunk_size);
+		}
 		i32 chunk_index = allocator->used_chunks-1;
 		block_allocator_chunk_t* current_chunk = allocator->chunks + chunk_index;
 		if (current_chunk->used_blocks < allocator->chunk_capacity_in_blocks) {

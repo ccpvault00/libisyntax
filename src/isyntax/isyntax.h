@@ -215,7 +215,9 @@ typedef struct isyntax_valid_data_envelope_t {
 	i32 vertex_count;
 } isyntax_valid_data_envelope_t;
 
-typedef struct isyntax_codeblock_t {
+// Everything the header says about a codeblock; only needed while isyntax_open() builds the tile tables
+// (72 bytes x up to ~700k codeblocks on a 2.5 GB slide), released at the end of the open.
+typedef struct isyntax_codeblock_header_t {
 	u32 x_coordinate;
 	u32 y_coordinate;
 	u32 color_component;
@@ -229,6 +231,15 @@ typedef struct isyntax_codeblock_t {
 	i32 block_x;
 	i32 block_y;
 	u64 block_id;
+} isyntax_codeblock_header_t;
+
+// What tile reads need per codeblock, kept for the lifetime of the handle (24 bytes).
+typedef struct isyntax_codeblock_t {
+	u64 block_data_offset;
+	u64 block_size;
+	u8 color_component;
+	u8 scale;
+	u8 coefficient; // 0 = LL, 1 = LH/HL/HH
 } isyntax_codeblock_t;
 
 typedef struct isyntax_data_chunk_t {
@@ -315,7 +326,8 @@ typedef struct isyntax_image_t {
 	i32 lossy_image_compression_ratio;
 	i32 number_of_blocks;
 	i32 codeblock_count;
-	isyntax_codeblock_t* codeblocks;
+	isyntax_codeblock_t* codeblocks;                 // compact, valid after isyntax_open() succeeded
+	isyntax_codeblock_header_t* codeblock_headers;   // only during isyntax_open()
 	i32 data_chunk_count;
 	isyntax_data_chunk_t* data_chunks;
 	bool header_codeblocks_are_partial;
