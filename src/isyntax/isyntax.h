@@ -449,8 +449,9 @@ typedef struct isyntax_t {
 bool isyntax_hulsken_decompress(u8 *compressed, size_t compressed_size, i32 block_width, i32 block_height, i32 coefficient, i32 compressor_version, i16* out_buffer);
 void isyntax_set_thread_pool(isyntax_t* isyntax, thread_pool_t* thread_pool);
 bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open_flags_t flags);
-// Returns the level's isyntax_tile_t table, building it from tile_entries on first use. Callers that may run
-// concurrently (isyntax_reader) must call it with the cache mutex held before any lock-free use of level->tiles.
+// Returns the level's isyntax_tile_t table, building it from tile_entries on first use (NULL if that allocation
+// fails). Callers that may run concurrently (isyntax_reader) must call it with the cache mutex held before any
+// lock-free use of level->tiles.
 isyntax_tile_t* isyntax_level_tiles(isyntax_image_t* wsi, i32 scale);
 void isyntax_destroy(isyntax_t* isyntax);
 void isyntax_idwt(icoeff_t* idwt, i32 quadrant_width, i32 quadrant_height, bool output_steps_as_png, const char* png_name);

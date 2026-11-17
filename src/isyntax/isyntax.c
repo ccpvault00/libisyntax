@@ -3161,6 +3161,10 @@ isyntax_tile_t* isyntax_level_tiles(isyntax_image_t* wsi, i32 scale) {
 		// Built on first use: most consumers never touch most levels, and every tile of every level costs
 		// 88 bytes here against 16 in tile_entries.
 		isyntax_tile_t* tiles = (isyntax_tile_t*) calloc(1, level->tile_count * sizeof(isyntax_tile_t));
+		if (!tiles) {
+			console_print_error("iSyntax: could not allocate the tile table of level %d (%llu tiles)\n", scale, level->tile_count);
+			return NULL;
+		}
 		for (i32 tile_y = 0; tile_y < level->height_in_tiles; ++tile_y) {
 			for (i32 tile_x = 0; tile_x < level->width_in_tiles; ++tile_x) {
 				i32 index = level->width_in_tiles * tile_y + tile_x;
@@ -3349,8 +3353,16 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 					console_print_error("iSyntax: invalid number of levels (%d)\n", num_levels);
 					goto failed;
 				}
-				i32 grid_width = ((wsi_image->width_including_padding + (block_width << num_levels) - 1) / (block_width << num_levels)) << (num_levels - 1);
-				i32 grid_height = ((wsi_image->height_including_padding + (block_height << num_levels) - 1) / (block_height << num_levels)) << (num_levels - 1);
+				i64 grid_width_64 = ((i64)wsi_image->width_including_padding + (block_width << num_levels) - 1) / (block_width << num_levels) << (num_levels - 1);
+				i64 grid_height_64 = ((i64)wsi_image->height_including_padding + (block_height << num_levels) - 1) / (block_height << num_levels) << (num_levels - 1);
+				// Tile coordinates are stored as u16 and tile counts as i32 (the header dimensions are file-controlled).
+				if (grid_width_64 <= 0 || grid_height_64 <= 0 || grid_width_64 > UINT16_MAX || grid_height_64 > UINT16_MAX ||
+				    grid_width_64 * grid_height_64 > INT32_MAX) {
+					console_print_error("iSyntax: unsupported tile grid %lld x %lld\n", grid_width_64, grid_height_64);
+					goto failed;
+				}
+				i32 grid_width = (i32)grid_width_64;
+				i32 grid_height = (i32)grid_height_64;
 
 				u64 h_coeff_tile_count = 0; // number of tiles with LH/HL/HH coefficients
 				i32 base_level_tile_count = grid_height * grid_width;

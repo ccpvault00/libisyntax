@@ -453,7 +453,15 @@ isyntax_error_t isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, in
     isyntax_error_t result = LIBISYNTAX_OK;
 
     platform_mutex_lock(&cache->mutex);
-    isyntax_tile_t* tile = &isyntax_level_tiles(wsi, scale)[level->width_in_tiles * tile_y + tile_x];
+    // Materialise every level this read can touch (children of the requested tile up to the top level) here, so
+    // that the accessor calls below and the lock-free uses inside isyntax_load_tile() never see a NULL table.
+    for (int s = (scale > 0 ? scale - 1 : 0); s <= wsi->max_scale; ++s) {
+        if (!isyntax_level_tiles(wsi, s)) {
+            platform_mutex_unlock(&cache->mutex);
+            return LIBISYNTAX_FATAL;
+        }
+    }
+    isyntax_tile_t* tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
     build_working_set(cache, isyntax, tile, &idwt_set, &coeff_set, &children_set);
 
     // Coefficients for every tile that feeds an IDWT.
