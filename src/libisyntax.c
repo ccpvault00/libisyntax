@@ -55,6 +55,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -110,7 +111,13 @@ void isyntax_log(int level, const char* fmt, ...) {
     while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r')) {
         buffer[--len] = '\0';
     }
-    callback((enum libisyntax_log_level_t)level, buffer, global_log_userdata);
+    // The level already says it; the historical "Error: " prefix of many messages would read doubled once a
+    // consumer prepends its own ("I/O error: Error: ...").
+    const char* text = buffer;
+    if (strncmp(text, "Error: ", 7) == 0) {
+        text += 7;
+    }
+    callback((enum libisyntax_log_level_t)level, text, global_log_userdata);
 }
 
 isyntax_error_t libisyntax_init() {
