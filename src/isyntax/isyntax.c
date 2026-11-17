@@ -773,12 +773,12 @@ static bool isyntax_parse_scannedimage_child_node(isyntax_t* isyntax, u32 group,
 							}
 
 							image->codeblock_count = block_count;
-							image->codeblocks = calloc(1, block_count * sizeof(isyntax_codeblock_t));
+							image->codeblock_headers = calloc(1, block_count * sizeof(isyntax_codeblock_header_t));
 							image->header_codeblocks_are_partial = true;
 
 							for (i32 i = 0; i < block_count; ++i) {
 								u8* header = block_header_start + i * sizeof(isyntax_partial_block_header_t);
-								isyntax_codeblock_t* codeblock = image->codeblocks + i;
+								isyntax_codeblock_header_t* codeblock = image->codeblock_headers + i;
 								codeblock->x_coordinate = isyntax_read_u32_le(header + offsetof(isyntax_partial_block_header_t, x_coordinate));
 								codeblock->y_coordinate = isyntax_read_u32_le(header + offsetof(isyntax_partial_block_header_t, y_coordinate));
 								codeblock->color_component = isyntax_read_u32_le(header + offsetof(isyntax_partial_block_header_t, color_component));
@@ -797,12 +797,12 @@ static bool isyntax_parse_scannedimage_child_node(isyntax_t* isyntax, u32 group,
 							}
 
 							image->codeblock_count = block_count;
-							image->codeblocks = calloc(1, block_count * sizeof(isyntax_codeblock_t));
+							image->codeblock_headers = calloc(1, block_count * sizeof(isyntax_codeblock_header_t));
 							image->header_codeblocks_are_partial = false;
 
 							for (i32 i = 0; i < block_count; ++i) {
 								u8* header = block_header_start + i * sizeof(isyntax_full_block_header_t);
-								isyntax_codeblock_t* codeblock = image->codeblocks + i;
+								isyntax_codeblock_header_t* codeblock = image->codeblock_headers + i;
 								codeblock->x_coordinate = isyntax_read_u32_le(header + offsetof(isyntax_full_block_header_t, x_coordinate));
 								codeblock->y_coordinate = isyntax_read_u32_le(header + offsetof(isyntax_full_block_header_t, y_coordinate));
 								codeblock->color_component = isyntax_read_u32_le(header + offsetof(isyntax_full_block_header_t, color_component));
@@ -867,10 +867,10 @@ static bool isyntax_parse_scannedimage_child_node(isyntax_t* isyntax, u32 group,
 						if (image->number_of_blocks <= 0) { // sanity check
 							goto decoding_cluster_header_table_failed;
 						}
-						if (image->codeblocks == NULL) {
+						if (image->codeblock_headers == NULL) {
 							// NOTE: this value seems to be much larger than the actual number of codeblocks present in the file
 							image->codeblock_count = image->number_of_blocks; // from UFS_IMAGE_NUMBER_OF_BLOCKS attribute
-							image->codeblocks = calloc(1, image->codeblock_count * sizeof(isyntax_codeblock_t));
+							image->codeblock_headers = calloc(1, image->codeblock_count * sizeof(isyntax_codeblock_header_t));
 						}
 
 						// pass 2: fill in all the information for each cluster
@@ -968,7 +968,7 @@ static bool isyntax_parse_scannedimage_child_node(isyntax_t* isyntax, u32 group,
 								goto decoding_cluster_header_table_failed;
 							}
 							for (i32 j = 0; j < block_count; ++j) {
-								isyntax_codeblock_t* codeblock = image->codeblocks + running_codeblock_index;
+								isyntax_codeblock_header_t* codeblock = image->codeblock_headers + running_codeblock_index;
 								isyntax_cluster_relative_coords_t* relative_codeblock_in_cluster_info = cluster_header_template->relative_coords_for_codeblock_in_cluster + j;
 								codeblock->x_coordinate = cluster_x + relative_codeblock_in_cluster_info->x;
 								codeblock->y_coordinate = cluster_y + relative_codeblock_in_cluster_info->y;
@@ -999,9 +999,9 @@ static bool isyntax_parse_scannedimage_child_node(isyntax_t* isyntax, u32 group,
 						if (running_codeblock_index < image->codeblock_count) {
 							// release excess allocated memory (there are fewer codeblocks present in the file than was anticipated)
 							image->codeblock_count = running_codeblock_index;
-							isyntax_codeblock_t* shrunk = realloc(image->codeblocks, image->codeblock_count * sizeof(isyntax_codeblock_t));
+							isyntax_codeblock_header_t* shrunk = realloc(image->codeblock_headers, image->codeblock_count * sizeof(isyntax_codeblock_header_t));
 							ASSERT(shrunk);
-							image->codeblocks = shrunk;
+							image->codeblock_headers = shrunk;
 						}
 
 						if (false) { decoding_cluster_header_table_failed:
@@ -3126,7 +3126,7 @@ static void isyntax_dump_block_header(isyntax_image_t* wsi_image, const char* fi
 		fprintf(test_block_header_fp, "x_coordinate,y_coordinate,color_component,scale,coefficient,block_data_offset,block_data_size,block_header_template_id\n");
 
 		for (i32 i = 0; i < wsi_image->codeblock_count; i += 1/*21*3*/) {
-			isyntax_codeblock_t* codeblock = wsi_image->codeblocks + i;
+			isyntax_codeblock_header_t* codeblock = wsi_image->codeblock_headers + i;
 			fprintf(test_block_header_fp, "%d,%d,%d,%d,%d,%lld,%lld,%d\n",
 //			        codeblock->x_adjusted,
 //			        codeblock->y_adjusted,
@@ -3177,6 +3177,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 		if (seektable != NULL) free(seektable);
 		isyntax_image_t* wsi_image = isyntax->images + isyntax->wsi_image_index;
 		if (wsi_image->image_type == ISYNTAX_IMAGE_TYPE_WSI) {
+			if (wsi_image->codeblock_headers != NULL) { free(wsi_image->codeblock_headers); wsi_image->codeblock_headers = NULL; }
 			if (wsi_image->data_chunks != NULL) free(wsi_image->data_chunks);
 			for (i32 i = 0; i < wsi_image->level_count; ++i) {
 				isyntax_level_t* level = wsi_image->levels + i;
@@ -3364,7 +3365,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 				i64 total_codeblock_count = total_coeff_tile_count * 3; // for 3 color channels
 
 				for (i32 i = 0; i < wsi_image->codeblock_count; ++i) {
-					isyntax_codeblock_t* codeblock = wsi_image->codeblocks + i;
+					isyntax_codeblock_header_t* codeblock = wsi_image->codeblock_headers + i;
 
 					// Calculate adjusted codeblock coordinates so that they fit the origin of the image
 					codeblock->x_adjusted = (i32)codeblock->x_coordinate - wsi_image->offset_x;
@@ -3442,7 +3443,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 						i32 seektable_entry_count = seektable_size / sizeof(isyntax_seektable_codeblock_header_t);
 
 						for (i32 i = 0; i < wsi_image->codeblock_count; ++i) {
-							isyntax_codeblock_t* codeblock = wsi_image->codeblocks + i;
+							isyntax_codeblock_header_t* codeblock = wsi_image->codeblock_headers + i;
 							if (codeblock->block_id >= (u64)seektable_entry_count) {
 								console_print_error("iSyntax: codeblock %d has block ID %llu outside the seektable (%d entries)\n", i, codeblock->block_id, seektable_entry_count);
 								goto failed;
@@ -3513,11 +3514,11 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 						i32 current_data_chunk_index = 0;
 						i32 next_data_chunk_index = 0;
 						for (i32 i = 0; i < wsi_image->codeblock_count; ++i) {
-							isyntax_codeblock_t* codeblock = wsi_image->codeblocks + i;
+							isyntax_codeblock_header_t* codeblock = wsi_image->codeblock_headers + i;
 							if (codeblock->color_component != 0) {
 								// Don't let color channels 1 and 2 overwrite what was already set
 								i = next_chunk_codeblock_index; // skip ahead
-								codeblock = wsi_image->codeblocks + i;
+								codeblock = wsi_image->codeblock_headers + i;
 								if (i >= wsi_image->codeblock_count) break;
 							}
 							// Keep track of where we are in the 'chunk' of codeblocks
@@ -3582,11 +3583,11 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 					i32 current_data_chunk_index = 0;
 					i32 next_data_chunk_index = 0;
 					for (i32 i = 0; i < wsi_image->codeblock_count; ++i) {
-						isyntax_codeblock_t* codeblock = wsi_image->codeblocks + i;
+						isyntax_codeblock_header_t* codeblock = wsi_image->codeblock_headers + i;
 						if (codeblock->color_component != 0) {
 							// Don't let color channels 1 and 2 overwrite what was already set
 							i = next_chunk_codeblock_index; // skip ahead
-							codeblock = wsi_image->codeblocks + i;
+							codeblock = wsi_image->codeblock_headers + i;
 							if (i >= wsi_image->codeblock_count) break;
 						}
 						// Keep track of where we are in the 'chunk' of codeblocks
@@ -3676,6 +3677,24 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 				}
 			}
 
+			// Keep only what tile reads need per codeblock (offset, size, kind); the parse-time header records are
+			// 3x larger and account for most of the memory a handle retains after open.
+			{
+				i32 count = wsi_image->codeblock_count;
+				isyntax_codeblock_t* compact = (isyntax_codeblock_t*)malloc(MAX(count, 1) * sizeof(isyntax_codeblock_t));
+				for (i32 i = 0; i < count; ++i) {
+					isyntax_codeblock_header_t* header = wsi_image->codeblock_headers + i;
+					compact[i].block_data_offset = header->block_data_offset;
+					compact[i].block_size = header->block_size;
+					compact[i].color_component = (u8)header->color_component;
+					compact[i].scale = (u8)header->scale;
+					compact[i].coefficient = (u8)header->coefficient;
+				}
+				wsi_image->codeblocks = compact;
+				free(wsi_image->codeblock_headers);
+				wsi_image->codeblock_headers = NULL;
+			}
+
 			success = true;
 
 			free(read_buffer);
@@ -3752,6 +3771,10 @@ void isyntax_destroy(isyntax_t* isyntax) {
 	for (i32 image_index = 0; image_index < isyntax->image_count; ++image_index) {
 		isyntax_image_t* image = isyntax->images + image_index;
 		if (image->image_type == ISYNTAX_IMAGE_TYPE_WSI) {
+			if (image->codeblock_headers) {
+				free(image->codeblock_headers);
+				image->codeblock_headers = NULL;
+			}
 			if (image->codeblocks) {
 				free(image->codeblocks);
 				image->codeblocks = NULL;
