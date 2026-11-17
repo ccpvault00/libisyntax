@@ -2,7 +2,7 @@ project(
   'libisyntax', 'c', 'cpp',
   version: '0.1.0',
   license : 'BSD-2-Clause',
-  meson_version : '>=0.51.0',
+  meson_version : '>=0.54.0',
   default_options : [
     'buildtype=release',
     'c_std=gnu11',
@@ -79,6 +79,7 @@ libisyntax_dep = declare_dependency(
   include_directories : include_directories('src'),
   link_with : isyntax,
 )
+meson.override_dependency('libisyntax', libisyntax_dep)
 
 pkg = import('pkgconfig')
 pkg.generate(isyntax)
