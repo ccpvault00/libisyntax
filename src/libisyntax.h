@@ -23,10 +23,27 @@
 typedef int32_t isyntax_error_t;
 
 #define LIBISYNTAX_OK 0
-// Generic error that the user should not expect to recover from.
+// Generic error that the user should not expect to recover from: the header or a codestream could not be decoded
+// (corrupt or unsupported data).
 #define LIBISYNTAX_FATAL 1
 // One of the arguments passed to a function is invalid.
 #define LIBISYNTAX_INVALID_ARGUMENT 2
+// The file could not be opened, is truncated, or a read returned fewer bytes than expected (seektable or
+// codeblock). The data that was read was not decoded, so this is an I/O problem rather than corrupt data.
+#define LIBISYNTAX_IO_ERROR 3
+
+// Diagnostics. libisyntax reports non-fatal problems (unreadable or undecodable codeblocks, malformed headers, ...)
+// through a process-wide callback. By default nothing is printed; set a callback to receive them. The message is
+// a single line without a trailing newline. The callback may be invoked from any thread, including libisyntax's
+// own worker threads, so it must be thread-safe. Passing NULL restores the silent default.
+// Fatal internal errors (assertion failures) still print to stderr and abort, as before.
+enum libisyntax_log_level_t {
+	LIBISYNTAX_LOG_DEBUG = 0,   // verbose progress messages
+	LIBISYNTAX_LOG_INFO = 1,
+	LIBISYNTAX_LOG_WARNING = 2, // problems that were handled (e.g. a codeblock skipped, dummy coefficients used)
+	LIBISYNTAX_LOG_ERROR = 3,   // problems that made an operation fail
+};
+typedef void (*libisyntax_log_callback_t)(enum libisyntax_log_level_t level, const char* message, void* userdata);
 
 enum isyntax_pixel_format_t {
   _LIBISYNTAX_PIXEL_FORMAT_START = 0x100,
@@ -51,6 +68,8 @@ typedef struct isyntax_cache_t isyntax_cache_t;
 //== Common API ==
 // TODO(avirodov): are repeated calls of libisyntax_init() allowed? Currently I believe not.
 isyntax_error_t libisyntax_init(void);
+// Set (or clear, with NULL) the process-wide diagnostics callback. See enum libisyntax_log_level_t above.
+void            libisyntax_set_log_callback(libisyntax_log_callback_t callback_or_null, void* userdata);
 isyntax_error_t libisyntax_open(const char* filename, enum libisyntax_open_flags_t flags, isyntax_t** out_isyntax);
 void            libisyntax_close(isyntax_t* isyntax);
 

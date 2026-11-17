@@ -99,14 +99,15 @@ static void tile_list_insert_list_first(isyntax_tile_list_t* target_list, isynta
     isyntax_tile_t* _iter = _list.head; _iter; _iter = _iter->cache_next
 
 
-// Returns false if a codeblock could not be read or decoded. The tile is still marked as loaded (with zero
-// coefficients) so that the cache stays consistent; the caller is expected to report the error.
-static bool isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* cache,
+// Returns LIBISYNTAX_OK, LIBISYNTAX_IO_ERROR (a codeblock could not be read: short read / truncated file) or
+// LIBISYNTAX_FATAL (a codeblock could not be decoded). The tile is still marked as loaded (with zero coefficients)
+// so that the cache stays consistent; the caller is expected to report the error.
+static isyntax_error_t isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* cache,
                                                              isyntax_t* isyntax, isyntax_tile_t* tile,
                                                              int codeblock_index, bool is_ll) {
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
     isyntax_data_chunk_t* chunk = &wsi->data_chunks[tile->data_chunk_index];
-    bool success = true;
+    isyntax_error_t result = LIBISYNTAX_OK;
 
     for (int color = 0; color < 3; ++color) {
         i64 index = (i64)codeblock_index + (i64)color * chunk->codeblock_count_per_color;
@@ -124,7 +125,7 @@ static bool isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* ca
             console_print_error("Error: iSyntax codeblock table does not match tile (scale %d, %d,%d) color %d\n",
                                 tile->tile_scale, tile->tile_x, tile->tile_y, color);
             memset(out_buffer, 0, (is_ll ? 1 : 3) * isyntax->block_width * isyntax->block_height * sizeof(icoeff_t));
-            success = false;
+            if (result == LIBISYNTAX_OK) result = LIBISYNTAX_FATAL;
             continue;
         }
         // TODO(avirodov): fancy allocators, for multiple sequential blocks (aka chunk). Or let OS do the caching.
@@ -138,13 +139,13 @@ static bool isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* ca
             console_print_error("Error: could not read iSyntax data at offset %lld (read size %lld, got %zu)\n",
                                 codeblock->block_data_offset, codeblock->block_size, bytes_read);
             memset(out_buffer, 0, (is_ll ? 1 : 3) * isyntax->block_width * isyntax->block_height * sizeof(icoeff_t));
-            success = false;
+            result = LIBISYNTAX_IO_ERROR;
         } else if (!isyntax_hulsken_decompress(codeblock_data, codeblock->block_size,
                                                isyntax->block_width, isyntax->block_height,
                                                codeblock->coefficient, wsi->compressor_version, out_buffer)) {
             console_print_error("Error: could not decode iSyntax codeblock at offset %lld (size %lld)\n",
                                 codeblock->block_data_offset, codeblock->block_size);
-            success = false;
+            if (result == LIBISYNTAX_OK) result = LIBISYNTAX_FATAL;
         }
         free(codeblock_data);
     }
@@ -154,22 +155,28 @@ static bool isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* ca
     } else {
         tile->has_h = true;
     }
-    return success;
+    return result;
 }
 
-static bool isyntax_openslide_load_tile_coefficients(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* tile) {
+// Combines two error codes: an I/O error (truncated file) takes precedence over a decode error.
+static isyntax_error_t worse_error(isyntax_error_t a, isyntax_error_t b) {
+    if (a == LIBISYNTAX_IO_ERROR || b == LIBISYNTAX_IO_ERROR) return LIBISYNTAX_IO_ERROR;
+    return a != LIBISYNTAX_OK ? a : b;
+}
+
+static isyntax_error_t isyntax_openslide_load_tile_coefficients(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* tile) {
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
-    bool success = true;
+    isyntax_error_t result = LIBISYNTAX_OK;
 
     if (!tile->exists) {
-        return true;
+        return LIBISYNTAX_OK;
     }
 
     // Load LL codeblocks here only for top-level tiles. For other levels, the LL coefficients are computed from parent
     // tiles later on.
     if (!tile->has_ll && tile->tile_scale == wsi->max_scale) {
-        success &= isyntax_openslide_load_tile_coefficients_ll_or_h(
-                cache, isyntax, tile, /*codeblock_index=*/tile->codeblock_index, /*is_ll=*/true);
+        result = worse_error(result, isyntax_openslide_load_tile_coefficients_ll_or_h(
+                cache, isyntax, tile, /*codeblock_index=*/tile->codeblock_index, /*is_ll=*/true));
     }
 
     if (!tile->has_h) {
@@ -189,11 +196,11 @@ static bool isyntax_openslide_load_tile_coefficients(isyntax_cache_t* cache, isy
             fatal_error();
         }
 
-        success &= isyntax_openslide_load_tile_coefficients_ll_or_h(
+        result = worse_error(result, isyntax_openslide_load_tile_coefficients_ll_or_h(
                 cache, isyntax, tile,
-                /*codeblock_index=*/tile->codeblock_chunk_index + codeblock_index_in_chunk, /*is_ll=*/false);
+                /*codeblock_index=*/tile->codeblock_chunk_index + codeblock_index_in_chunk, /*is_ll=*/false));
     }
-    return success;
+    return result;
 }
 
 typedef union isyntax_tile_children_t {
@@ -342,8 +349,8 @@ static void isyntax_make_tile_lists_by_scale(isyntax_t* isyntax, int start_scale
     }
 }
 
-bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
-                       uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format) {
+isyntax_error_t isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
+                                  uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format) {
     // TODO(avirodov): more granular locking (some notes below). This will require handling overlapping work, that is
     //  thread A needing tile 123 and started to load it, and thread B needing same tile 123 and needs to wait for A.
     // TODO(pvalkema): Can we safely lock the mutex later, after checking if the tile exists?
@@ -356,7 +363,7 @@ bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
 		// Read out of bounds -> set to all white
 		memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
         platform_mutex_unlock(&cache->mutex);
-		return true;
+		return LIBISYNTAX_OK;
 	}
 
     isyntax_tile_t *tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
@@ -364,7 +371,7 @@ bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
     if (!tile->exists) {
         memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
         platform_mutex_unlock(&cache->mutex);
-        return true;
+        return LIBISYNTAX_OK;
     }
 
     // Need 3 lists:
@@ -397,12 +404,12 @@ bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
     // IDWT as needed, top to bottom. This should produce idwt for this tile as well, which should be last in idwt list.
     // YCoCb->RGB for this tile only.
     // On a decode error the affected tiles hold zero coefficients; finish the bookkeeping below and report it.
-    bool success = true;
+    isyntax_error_t result = LIBISYNTAX_OK;
     for (ITERATE_TILE_LIST(tile, coeff_list)) {
-        success &= isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
+        result = worse_error(result, isyntax_openslide_load_tile_coefficients(cache, isyntax, tile));
     }
     for (ITERATE_TILE_LIST(tile, idwt_list)) {
-        success &= isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
+        result = worse_error(result, isyntax_openslide_load_tile_coefficients(cache, isyntax, tile));
     }
     for (ITERATE_TILE_LIST(tile, idwt_list)) {
         if (tile == idwt_list.tail) {
@@ -448,5 +455,5 @@ bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
     }
 
     platform_mutex_unlock(&cache->mutex);
-    return success;
+    return result;
 }

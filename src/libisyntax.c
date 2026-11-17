@@ -52,6 +52,9 @@
 #include "platform.h"
 #include "intrinsics.h"
 
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 #include "libisyntax.h"
 #include "isyntax.h"
 #include "isyntax_reader.h"
@@ -72,6 +75,46 @@
 i32 volatile dbgctr_init_thread_pool_counter = 0;
 
 static platform_mutex_t libisyntax_global_mutex = PLATFORM_MUTEX_INITIALIZER;
+
+// ---- diagnostics ---------------------------------------------------------------------------------------------------
+// The callback pointer and its userdata are read without a lock on the hot path; libisyntax_set_log_callback() is
+// expected to be called before other threads use the library (as with libisyntax_init()).
+static libisyntax_log_callback_t global_log_callback = NULL;
+static void* global_log_userdata = NULL;
+
+void libisyntax_set_log_callback(libisyntax_log_callback_t callback_or_null, void* userdata) {
+    global_log_userdata = userdata;
+    global_log_callback = callback_or_null;
+}
+
+void isyntax_log(int level, const char* fmt, ...) {
+    libisyntax_log_callback_t callback = global_log_callback;
+    if (!callback) {
+        return;
+    }
+    char buffer[1024];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    if (len < 0) {
+        return;
+    }
+    if (len >= (int)sizeof(buffer)) {
+        len = (int)sizeof(buffer) - 1;
+    }
+    // The historical format strings end with a newline; deliver one line without it.
+    while (len > 0 && (buffer[len - 1] == '\n' || buffer[len - 1] == '\r')) {
+        buffer[--len] = '\0';
+    }
+    // The level already says it; the historical "Error: " prefix of many messages would read doubled once a
+    // consumer prepends its own ("I/O error: Error: ...").
+    const char* text = buffer;
+    if (strncmp(text, "Error: ", 7) == 0) {
+        text += 7;
+    }
+    callback((enum libisyntax_log_level_t)level, text, global_log_userdata);
+}
 
 isyntax_error_t libisyntax_init() {
     // Lock-unlock to ensure that all parallel calls to libisyntax_init() wait for the actual initialization to complete.
@@ -109,8 +152,9 @@ isyntax_error_t libisyntax_open(const char* filename, enum libisyntax_open_flags
         *out_isyntax = result;
         return LIBISYNTAX_OK;
     } else {
+        isyntax_error_t error = result->open_error == LIBISYNTAX_OK ? LIBISYNTAX_FATAL : result->open_error;
         free(result);
-        return LIBISYNTAX_FATAL;
+        return error;
     }
 }
 
@@ -368,10 +412,7 @@ isyntax_error_t libisyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* isynta
 
     // TODO(avirodov): if isyntax_cache is null, we can support using allocators that are in isyntax object,
     //  if is_init_allocators = 1 when created. Not sure is needed.
-    if (!isyntax_tile_read(isyntax, isyntax_cache, level, tile_x, tile_y, pixels_buffer, pixel_format)) {
-        return LIBISYNTAX_FATAL;
-    }
-    return LIBISYNTAX_OK;
+    return isyntax_tile_read(isyntax, isyntax_cache, level, tile_x, tile_y, pixels_buffer, pixel_format);
 }
 
 #define PER_LEVEL_PADDING 3

@@ -1,7 +1,8 @@
 // corrupt_input_test SLIDE [TMPDIR]
 // Makes damaged copies of SLIDE (truncated in the XML header, truncated after ~60 %, random bit flips in the
 // second half, a zeroed 16 MB window) and opens + reads tiles from each through the public API. Every case must
-// come back with a return code - never abort, crash or hang. Exit status 0 if so. Needs ~2x the slide's size in
+// come back with a return code - never abort, crash or hang - and truncation must report LIBISYNTAX_IO_ERROR,
+// corrupt data LIBISYNTAX_FATAL; diagnostics must be silent by default and reach the log callback. Exit status 0 if so. Needs ~2x the slide's size in
 // TMPDIR (default: the current directory); the copies are deleted afterwards.
 #include "libisyntax.h"
 #include <stdio.h>
@@ -10,6 +11,10 @@
 #include <stdint.h>
 
 static int failures = 0;
+static int log_messages = 0;
+static void count_log(enum libisyntax_log_level_t level, const char* message, void* userdata) {
+    (void)level; (void)message; (void)userdata; log_messages++;
+}
 
 static long copy_file(const char* src, const char* dst, long max_bytes) {
     FILE* in = fopen(src, "rb"); FILE* out = fopen(dst, "wb");
@@ -39,10 +44,16 @@ static void damage(const char* path, long from, long to, int flips, int zero_win
     fclose(f);
 }
 
-static void expect(const char* what, const char* path) {
+// expected_error: the only error code the damaged file may produce (0 = any error is fine).
+static void check_code(isyntax_error_t e, isyntax_error_t expected_error) {
+    if (expected_error && e != LIBISYNTAX_OK && e != expected_error) { printf(" [expected error %d, got %d]", expected_error, e); failures++; }
+}
+
+static void expect(const char* what, const char* path, isyntax_error_t expected_error) {
     isyntax_t* s = NULL;
     isyntax_error_t e = libisyntax_open(path, 0, &s);
     printf("%-28s open -> %d", what, e);
+    check_code(e, expected_error);
     if (e != LIBISYNTAX_OK) { printf(" (error reported, ok)\n"); return; }
     isyntax_cache_t* c; libisyntax_cache_create("corrupt_input_test", 500, &c); libisyntax_cache_inject(c, s);
     const isyntax_image_t* wsi = libisyntax_get_wsi_image(s); int levels = libisyntax_image_get_level_count(wsi);
@@ -53,7 +64,8 @@ static void expect(const char* what, const char* path) {
         const isyntax_level_t* L = libisyntax_image_get_level(wsi, lv);
         int w = libisyntax_level_get_width_in_tiles(L), h = libisyntax_level_get_height_in_tiles(L);
         for (int y = 0; y < h; y += (h > 8 ? h / 8 : 1)) for (int x = 0; x < w; x += (w > 8 ? w / 8 : 1)) {
-            reads++; if (libisyntax_tile_read(s, c, lv, x, y, buf, LIBISYNTAX_PIXEL_FORMAT_RGBA) != LIBISYNTAX_OK) errors++;
+            reads++; e = libisyntax_tile_read(s, c, lv, x, y, buf, LIBISYNTAX_PIXEL_FORMAT_RGBA);
+            if (e != LIBISYNTAX_OK) { errors++; check_code(e, expected_error); }
         }
         if (levels == 1) break;
     }
@@ -76,12 +88,18 @@ int main(int argc, char** argv) {
     copy_file(argv[1], p2, size * 6 / 10);           // cut inside the codeblocks
     copy_file(argv[1], p3, -1); damage(p3, size / 2, size, 2000, 0);        // bit flips in codeblocks
     copy_file(argv[1], p4, -1); damage(p4, size * 4 / 10, size, 0, 16);     // 16 MB of zeros
-    expect("intact", argv[1]);
-    expect("truncated header", p1);
-    expect("truncated at 60%", p2);
-    expect("2000 bit flips", p3);
-    expect("16 MB zero window", p4);
+    expect("intact", argv[1], 0);
+    expect("truncated header", p1, LIBISYNTAX_IO_ERROR);
+    expect("truncated at 60%", p2, LIBISYNTAX_IO_ERROR);
+    expect("2000 bit flips", p3, LIBISYNTAX_FATAL);
+    expect("16 MB zero window", p4, LIBISYNTAX_FATAL);
+    // Diagnostics are silent by default (the runs above printed nothing) and go to the callback once set.
+    libisyntax_set_log_callback(count_log, NULL);
+    expect("truncated at 60%, logged", p2, LIBISYNTAX_IO_ERROR);
+    libisyntax_set_log_callback(NULL, NULL);
+    printf("log callback received %d messages for the truncated file\n", log_messages);
+    if (log_messages == 0) { printf("expected at least one diagnostic through the callback\n"); failures++; }
     remove(p1); remove(p2); remove(p3); remove(p4);
-    printf("corrupt_input_test: %s\n", failures ? "FAILED" : "passed (no abort, no hang)");
+    printf("corrupt_input_test: %s\n", failures ? "FAILED" : "passed (no abort, no hang, expected error kinds)");
     return failures ? 1 : 0;
 }

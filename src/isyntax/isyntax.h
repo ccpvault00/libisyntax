@@ -372,6 +372,7 @@ typedef struct isyntax_xml_parser_t {
 typedef struct isyntax_t {
 	enum libisyntax_open_flags_t open_flags;
 	i64 filesize;
+	i32 open_error; // isyntax_error_t set by isyntax_open() on failure (LIBISYNTAX_IO_ERROR or LIBISYNTAX_FATAL)
 	file_handle_t file_handle;
 	isyntax_image_t images[16];
 	i32 image_count;
