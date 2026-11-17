@@ -211,7 +211,7 @@ static isyntax_tile_children_t isyntax_openslide_compute_children(isyntax_t* isy
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
     ASSERT(tile->tile_scale > 0);
     isyntax_level_t *next_level = &wsi->levels[tile->tile_scale - 1];
-    result.child_top_left = next_level->tiles + (tile->tile_y * 2) * next_level->width_in_tiles + (tile->tile_x * 2);
+    result.child_top_left = isyntax_level_tiles(wsi, tile->tile_scale - 1) + (tile->tile_y * 2) * next_level->width_in_tiles + (tile->tile_x * 2);
     result.child_top_right = result.child_top_left + 1;
     result.child_bottom_left = result.child_top_left + next_level->width_in_tiles;
     result.child_bottom_right = result.child_bottom_left + 1;
@@ -300,7 +300,7 @@ static void reserve_parent(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_t
         return;
     }
     isyntax_level_t* parent_level = &wsi->levels[parent_tile_scale];
-    isyntax_tile_t* parent_tile = &parent_level->tiles[parent_level->width_in_tiles * (tile->tile_y / 2) + (tile->tile_x / 2)];
+    isyntax_tile_t* parent_tile = &isyntax_level_tiles(wsi, parent_tile_scale)[parent_level->width_in_tiles * (tile->tile_y / 2) + (tile->tile_x / 2)];
     if (parent_tile->exists && !parent_tile->cache_marked) {
         reserve_tile(cache, parent_tile, idwt_set);
     }
@@ -315,6 +315,7 @@ static void build_working_set(isyntax_cache_t* cache, isyntax_t* isyntax, isynta
     reserve_tile(cache, requested, idwt_set);
     for (int scale = requested->tile_scale; scale <= wsi->max_scale; ++scale) {
         isyntax_level_t* level = &wsi->levels[scale];
+        isyntax_tile_t* level_tiles = isyntax_level_tiles(wsi, scale);
         for (int i = 0; i < idwt_set->count; ++i) {
             isyntax_tile_t* tile = idwt_set->items[i];
             if (tile->tile_scale != scale) {
@@ -328,7 +329,7 @@ static void build_working_set(isyntax_cache_t* cache, isyntax_t* isyntax, isynta
                         neighbor_tile_y < 0 || neighbor_tile_y >= level->height_in_tiles) {
                         continue;
                     }
-                    isyntax_tile_t* neighbor_tile = &level->tiles[level->width_in_tiles * neighbor_tile_y + neighbor_tile_x];
+                    isyntax_tile_t* neighbor_tile = &level_tiles[level->width_in_tiles * neighbor_tile_y + neighbor_tile_x];
                     if (neighbor_tile->cache_marked || !neighbor_tile->exists) {
                         continue;
                     }
@@ -439,8 +440,9 @@ isyntax_error_t isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, in
         memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
         return LIBISYNTAX_OK;
     }
-    isyntax_tile_t* tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
-    if (!tile->exists) {
+    // tile_entries is immutable after open, so the existence check needs no lock; the tile table itself is
+    // built (once) under the mutex.
+    if (!level->tile_entries[level->width_in_tiles * tile_y + tile_x].exists) {
         memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
         return LIBISYNTAX_OK;
     }
@@ -451,6 +453,7 @@ isyntax_error_t isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, in
     isyntax_error_t result = LIBISYNTAX_OK;
 
     platform_mutex_lock(&cache->mutex);
+    isyntax_tile_t* tile = &isyntax_level_tiles(wsi, scale)[level->width_in_tiles * tile_y + tile_x];
     build_working_set(cache, isyntax, tile, &idwt_set, &coeff_set, &children_set);
 
     // Coefficients for every tile that feeds an IDWT.
