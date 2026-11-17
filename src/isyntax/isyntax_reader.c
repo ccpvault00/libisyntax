@@ -218,7 +218,7 @@ static isyntax_tile_children_t isyntax_openslide_compute_children(isyntax_t* isy
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
     ASSERT(tile->tile_scale > 0);
     isyntax_level_t *next_level = &wsi->levels[tile->tile_scale - 1];
-    result.child_top_left = next_level->tiles + (tile->tile_y * 2) * next_level->width_in_tiles + (tile->tile_x * 2);
+    result.child_top_left = isyntax_level_tiles(wsi, tile->tile_scale - 1) + (tile->tile_y * 2) * next_level->width_in_tiles + (tile->tile_x * 2);
     result.child_top_right = result.child_top_left + 1;
     result.child_bottom_left = result.child_top_left + next_level->width_in_tiles;
     result.child_bottom_right = result.child_bottom_left + 1;
@@ -272,7 +272,7 @@ static void isyntax_make_tile_lists_add_parent_to_list(isyntax_t* isyntax, isynt
     int parent_tile_x = tile->tile_x / 2;
     int parent_tile_y = tile->tile_y / 2;
     isyntax_level_t* parent_level = &wsi->levels[parent_tile_scale];
-    isyntax_tile_t* parent_tile = &parent_level->tiles[parent_level->width_in_tiles * parent_tile_y + parent_tile_x];
+    isyntax_tile_t* parent_tile = &isyntax_level_tiles(wsi, parent_tile_scale)[parent_level->width_in_tiles * parent_tile_y + parent_tile_x];
     if (parent_tile->exists && !parent_tile->cache_marked) {
         tile_list_remove(cache_list, parent_tile);
         parent_tile->cache_marked = true;
@@ -313,7 +313,7 @@ static void isyntax_make_tile_lists_by_scale(isyntax_t* isyntax, int start_scale
                             continue;
                         }
 
-                        isyntax_tile_t* neighbor_tile = &level->tiles[level->width_in_tiles * neighbor_tile_y + neighbor_tile_x];
+                        isyntax_tile_t* neighbor_tile = &isyntax_level_tiles(wsi, scale)[level->width_in_tiles * neighbor_tile_y + neighbor_tile_x];
                         if (neighbor_tile->cache_marked || !neighbor_tile->exists) {
                             continue;
                         }
@@ -366,6 +366,14 @@ isyntax_error_t isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, in
 		return LIBISYNTAX_OK;
 	}
 
+    // Build the tile tables of every level this read can touch (children of the requested tile up to the top
+    // level); the mutex is held, so this is the only place a table is created.
+    for (int s = (scale > 0 ? scale - 1 : 0); s <= wsi->max_scale; ++s) {
+        if (!isyntax_level_tiles(wsi, s)) {
+            platform_mutex_unlock(&cache->mutex);
+            return LIBISYNTAX_FATAL;
+        }
+    }
     isyntax_tile_t *tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
     // printf("=== isyntax_openslide_load_tile scale=%d tile_x=%d tile_y=%d\n", scale, tile_x, tile_y);
     if (!tile->exists) {

@@ -3151,6 +3151,31 @@ void isyntax_set_thread_pool(isyntax_t* isyntax, thread_pool_t* thread_pool) {
 }
 
 
+isyntax_tile_t* isyntax_level_tiles(isyntax_image_t* wsi, i32 scale) {
+	isyntax_level_t* level = wsi->levels + scale;
+	if (!level->tiles) {
+		// Built on first use: most consumers never touch most levels, and every tile of every level costs
+		// 88 bytes here against 16 in tile_entries.
+		isyntax_tile_t* tiles = (isyntax_tile_t*) calloc(1, level->tile_count * sizeof(isyntax_tile_t));
+		for (i32 tile_y = 0; tile_y < level->height_in_tiles; ++tile_y) {
+			for (i32 tile_x = 0; tile_x < level->width_in_tiles; ++tile_x) {
+				i32 index = level->width_in_tiles * tile_y + tile_x;
+				isyntax_tile_t* tile = tiles + index;
+				isyntax_tile_entry_t* entry = level->tile_entries + index;
+				tile->exists = entry->exists != 0;
+				tile->codeblock_index = entry->codeblock_index;
+				tile->codeblock_chunk_index = entry->codeblock_chunk_index;
+				tile->data_chunk_index = entry->data_chunk_index;
+				tile->tile_scale = (u8)scale;
+				tile->tile_x = (u16)tile_x;
+				tile->tile_y = (u16)tile_y;
+			}
+		}
+		level->tiles = tiles;
+	}
+	return level->tiles;
+}
+
 bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open_flags_t flags) {
 
 	console_print_verbose("Attempting to open iSyntax: %s\n", filename);
@@ -3177,6 +3202,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 			if (wsi_image->data_chunks != NULL) free(wsi_image->data_chunks);
 			for (i32 i = 0; i < wsi_image->level_count; ++i) {
 				isyntax_level_t* level = wsi_image->levels + i;
+				if (level->tile_entries != NULL) free(level->tile_entries);
 				if (level->tiles != NULL) free(level->tiles);
 			}
 		}
@@ -3327,8 +3353,9 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 				}
 				i64 grid_width_64 = ((i64)wsi_image->width_including_padding + ((i64)block_width << num_levels) - 1) / ((i64)block_width << num_levels) << (num_levels - 1);
 				i64 grid_height_64 = ((i64)wsi_image->height_including_padding + ((i64)block_height << num_levels) - 1) / ((i64)block_height << num_levels) << (num_levels - 1);
-				// Tile counts are stored as i32 (the header dimensions are file-controlled).
-				if (grid_width_64 <= 0 || grid_height_64 <= 0 || grid_width_64 * grid_height_64 > INT32_MAX) {
+				// Tile coordinates are stored as u16 and tile counts as i32 (the header dimensions are file-controlled).
+				if (grid_width_64 <= 0 || grid_height_64 <= 0 || grid_width_64 > UINT16_MAX || grid_height_64 > UINT16_MAX ||
+				    grid_width_64 * grid_height_64 > INT32_MAX) {
 					console_print_error("iSyntax: unsupported tile grid %lld x %lld\n", grid_width_64, grid_height_64);
 					goto failed;
 				}
@@ -3516,7 +3543,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 						for (i32 i = 0; i < wsi_image->level_count; ++i) {
 							isyntax_level_t* level = wsi_image->levels + i;
 							// NOTE: Tile entry with codeblock_index == 0 will mean there is no codeblock for this tile (empty/background)
-							level->tiles = (isyntax_tile_t*) calloc(1, level->tile_count * sizeof(isyntax_tile_t));
+							level->tile_entries = (isyntax_tile_entry_t*) calloc(1, level->tile_count * sizeof(isyntax_tile_entry_t));
 						}
 						i32 current_chunk_codeblock_index = 0;
 						i32 next_chunk_codeblock_index = 0;
@@ -3562,10 +3589,10 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 								console_print_error("iSyntax: codeblock %d maps to tile %d outside level %u (%llu tiles)\n", i, tile_index, codeblock->scale, level->tile_count);
 								goto failed;
 							}
-							level->tiles[tile_index].exists = true;
-							level->tiles[tile_index].codeblock_index = i;
-							level->tiles[tile_index].codeblock_chunk_index = current_chunk_codeblock_index;
-							level->tiles[tile_index].data_chunk_index = current_data_chunk_index;
+							level->tile_entries[tile_index].exists = 1;
+							level->tile_entries[tile_index].codeblock_index = i;
+							level->tile_entries[tile_index].codeblock_chunk_index = current_chunk_codeblock_index;
+							level->tile_entries[tile_index].data_chunk_index = current_data_chunk_index;
 
 						}
 
@@ -3583,7 +3610,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 					for (i32 i = 0; i < wsi_image->level_count; ++i) {
 						isyntax_level_t* level = wsi_image->levels + i;
 						// NOTE: Tile entry with codeblock_index == 0 will mean there is no codeblock for this tile (empty/background)
-						level->tiles = (isyntax_tile_t*) calloc(1, level->tile_count * sizeof(isyntax_tile_t));
+						level->tile_entries = (isyntax_tile_entry_t*) calloc(1, level->tile_count * sizeof(isyntax_tile_entry_t));
 					}
 
 					// TODO: refactor code duplication: this is (probably) mostly wrong!
@@ -3634,10 +3661,10 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 							console_print_error("iSyntax: codeblock %d maps to tile %d outside level %u (%llu tiles)\n", i, tile_index, codeblock->scale, level->tile_count);
 							goto failed;
 						}
-						level->tiles[tile_index].exists = true;
-						level->tiles[tile_index].codeblock_index = i;
-						level->tiles[tile_index].codeblock_chunk_index = current_chunk_codeblock_index;
-						level->tiles[tile_index].data_chunk_index = current_data_chunk_index;
+						level->tile_entries[tile_index].exists = 1;
+						level->tile_entries[tile_index].codeblock_index = i;
+						level->tile_entries[tile_index].codeblock_chunk_index = current_chunk_codeblock_index;
+						level->tile_entries[tile_index].data_chunk_index = current_data_chunk_index;
 
 					}
 
@@ -3708,18 +3735,6 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 
 			free(read_buffer);
 
-			// Populate debug info.
-			for (int scale = 0; scale < wsi_image->level_count; ++scale) {
-				isyntax_level_t* level = &wsi_image->levels[scale];
-				for (int tile_y = 0; tile_y < level->height_in_tiles; ++tile_y) {
-					for (int tile_x = 0; tile_x < level->width_in_tiles; ++tile_x) {
-						isyntax_tile_t* tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
-						tile->tile_scale = scale;
-						tile->tile_x = tile_x;
-						tile->tile_y = tile_y;
-					}
-				}
-			}
 		}
 		file_stream_close(fp);
 
@@ -3813,6 +3828,10 @@ void isyntax_destroy(isyntax_t* isyntax) {
 #endif
 					free(level->tiles);
 					level->tiles = NULL;
+				}
+				if (level->tile_entries) {
+					free(level->tile_entries);
+					level->tile_entries = NULL;
 				}
 			}
 		}

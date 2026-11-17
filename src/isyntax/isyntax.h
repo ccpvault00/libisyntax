@@ -255,38 +255,41 @@ typedef struct isyntax_data_chunk_t {
 typedef struct isyntax_tile_channel_t {
 	icoeff_t* coeff_h;
 	icoeff_t* coeff_ll;
-	u32 neighbors_loaded;
 } isyntax_tile_channel_t;
 
-typedef struct isyntax_tile_t {
+// What isyntax_open() records per tile (16 bytes for every tile of every level); the full isyntax_tile_t table
+// of a level is built from it on first access to that level (isyntax_level_tiles()).
+typedef struct isyntax_tile_entry_t {
 	u32 codeblock_index;
 	u32 codeblock_chunk_index;
 	u32 data_chunk_index;
+	u8 exists;
+} isyntax_tile_entry_t;
+
+// 88 bytes; a level's table is allocated on first access (see isyntax_tile_entry_t).
+typedef struct isyntax_tile_t {
 	isyntax_tile_channel_t color_channels[3];
-	u32 ll_invalid_edges;
+    // Cache management.
+    // TODO(avirodov): need to rethink this, maybe an external struct that points to isyntax_tile_t. The benefit
+    //   is that the cache is usually smaller than the number of tiles. The con is that I'll need to manage list memory
+    //   (probably another allocator for small objects - list nodes).
+    struct isyntax_tile_t* cache_next;
+    struct isyntax_tile_t* cache_prev;
+	u32 codeblock_index;
+	u32 codeblock_chunk_index;
+	u32 data_chunk_index;
+    // Note(avirodov): this is needed for isyntax_reader. It is very convenient to be able to compute neighbors
+    // from the tile itself, although at the cost of additional memory per tile.
+    u16 tile_x;
+    u16 tile_y;
+    u8 tile_scale;
 	bool exists;
 	bool has_ll;
 	bool has_h;
 	bool is_submitted_for_h_coeff_decompression;
 	bool is_submitted_for_loading;
 	bool is_loaded;
-
-    // Cache management.
-    // TODO(avirodov): need to rethink this, maybe an external struct that points to isyntax_tile_t. The benefit
-    //   is that the cache is usually smaller than the number of tiles. The con is that I'll need to manage list memory
-    //   (probably another allocator for small objects - list nodes).
     bool cache_marked;
-    struct isyntax_tile_t* cache_next;
-    struct isyntax_tile_t* cache_prev;
-
-    // Note(avirodov): this is needed for isyntax_reader. It is very convenient to be able to compute neighbors
-    // from the tile itself, although at the cost of additional memory (3 ints) per tile.
-    // TODO(avirodov): reconsider this as part of moving out cache_* fields, if applicable.
-    // TODO(avirodov): tile_x and tile_y can be computed by O(1) pointer arithmetic given scale. Scale can be
-    //  computed as well, but in O(L) where L is number of levels, and that will be computed often.
-    int tile_scale;
-    int tile_x;
-    int tile_y;
 } isyntax_tile_t;
 
 typedef struct isyntax_level_t {
@@ -303,7 +306,8 @@ typedef struct isyntax_level_t {
 	u64 tile_count;
 	i32 origin_offset_in_pixels;
 	v2f origin_offset;
-	isyntax_tile_t* tiles;
+	isyntax_tile_entry_t* tile_entries; // one per tile, filled by isyntax_open()
+	isyntax_tile_t* tiles;              // NULL until isyntax_level_tiles() builds it (under the cache mutex)
 	bool is_fully_loaded;
 } isyntax_level_t;
 
@@ -440,6 +444,9 @@ typedef struct isyntax_t {
 bool isyntax_hulsken_decompress(u8 *compressed, size_t compressed_size, i32 block_width, i32 block_height, i32 coefficient, i32 compressor_version, i16* out_buffer);
 void isyntax_set_thread_pool(isyntax_t* isyntax, thread_pool_t* thread_pool);
 bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open_flags_t flags);
+// Returns the level's isyntax_tile_t table, building it from tile_entries on first use. Callers that may run
+// concurrently (isyntax_reader) must call it with the cache mutex held before any lock-free use of level->tiles.
+isyntax_tile_t* isyntax_level_tiles(isyntax_image_t* wsi, i32 scale);
 void isyntax_destroy(isyntax_t* isyntax);
 void isyntax_idwt(icoeff_t* idwt, i32 quadrant_width, i32 quadrant_height, bool output_steps_as_png, const char* png_name);
 void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 tile_x, i32 tile_y, block_allocator_t* ll_coeff_block_allocator,

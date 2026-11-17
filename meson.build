@@ -160,4 +160,12 @@ if get_option('tests')
     dependencies : [libisyntax_dep],
   )
   test('corrupt_input_test', corrupt_input_test, args : [testslide, meson.current_build_dir()], timeout : 600)
+
+  # Prints the resident memory a handle costs after open and after the first reads (Linux only).
+  open_memory_report = executable(
+    'open_memory_report',
+    'test/open_memory_report.c',
+    dependencies : [libisyntax_dep],
+  )
+  test('open_memory_report', open_memory_report, args : [testslide])
 endif

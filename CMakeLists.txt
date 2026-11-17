@@ -175,6 +175,12 @@ if(BUILD_TESTING)
     add_test(NAME corrupt_input_test
             COMMAND corrupt_input_test ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/testslide.isyntax ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 
+    # Prints the resident memory a handle costs after open and after the first reads (Linux only).
+    add_executable(open_memory_report test/open_memory_report.c)
+    target_link_libraries(open_memory_report isyntax)
+    add_test(NAME open_memory_report
+            COMMAND open_memory_report ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/testslide.isyntax)
+
 
 endif() # if(BUILD_TESTING)
 
