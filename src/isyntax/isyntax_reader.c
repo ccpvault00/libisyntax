@@ -160,7 +160,7 @@ static bool isyntax_openslide_load_tile_coefficients(isyntax_cache_t* cache, isy
 
     // Load LL codeblocks here only for top-level tiles. For other levels, the LL coefficients are computed from parent
     // tiles later on.
-    if (!tile->has_ll && tile->tile_scale == wsi->max_scale) {
+    if (tile->tile_scale == wsi->max_scale && !tile->has_ll) {
         success &= isyntax_openslide_load_tile_coefficients_ll_or_h(
                 cache, isyntax, tile, /*codeblock_index=*/tile->codeblock_index, /*is_ll=*/true);
     }
@@ -247,199 +247,249 @@ static void isyntax_openslide_idwt(isyntax_cache_t* cache, isyntax_t* isyntax, i
                       /*pixels_buffer=*/NULL, /*pixel_format=*/0);
 }
 
-static void isyntax_make_tile_lists_add_parent_to_list(isyntax_t* isyntax, isyntax_tile_t* tile,
-                                                       isyntax_tile_list_t* idwt_list, isyntax_tile_list_t* cache_list) {
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Concurrent tile reads on one cache.
+//
+// A read needs a working set of tiles: the requested tile and its ancestors (idwt_set, inverse wavelet transforms that
+// produce LL coefficients for the next level), their neighbours (coeff_set, their H coefficients feed the IDWT margins)
+// and the children of every IDWT tile (children_set, they receive LL coefficients). The set is computed with the cache
+// mutex held and every tile in it is reserved (reader_refcount), which keeps it out of the LRU list and thus away from
+// eviction. The expensive work (codeblock I/O + Hulsken decode, IDWT, colour conversion) then runs outside the mutex,
+// serialised per tile by reader_in_progress: a thread that needs a tile another thread is working on waits on the
+// condition variable instead of duplicating or racing the work. A thread never waits while it holds reader_in_progress
+// on a tile, so there are no wait cycles. Results are deterministic because an IDWT only runs once all of its
+// dependencies are loaded, and LL coefficients that exist are never rewritten (see isyntax_load_tile()).
+// ---------------------------------------------------------------------------------------------------------------------
+
+typedef struct tile_array_t {
+    isyntax_tile_t** items;
+    int count;
+    int capacity;
+} tile_array_t;
+
+static void tile_array_push(tile_array_t* array, isyntax_tile_t* tile) {
+    if (array->count == array->capacity) {
+        array->capacity = array->capacity ? array->capacity * 2 : 64;
+        array->items = realloc(array->items, array->capacity * sizeof(*array->items));
+    }
+    array->items[array->count++] = tile;
+}
+
+// Mutex held. Marks the tile as visited for this working-set computation and reserves it.
+static void reserve_tile(isyntax_cache_t* cache, isyntax_tile_t* tile, tile_array_t* set) {
+    tile->cache_marked = true;
+    if (tile->reader_refcount++ == 0) {
+        tile_list_remove(&cache->cache_list, tile); // no-op if it was never cached
+    }
+    tile_array_push(set, tile);
+}
+
+// Mutex held.
+static void reserve_parent(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* tile, tile_array_t* idwt_set) {
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
     int parent_tile_scale = tile->tile_scale + 1;
     if (parent_tile_scale > wsi->max_scale) {
         return;
     }
-
-    int parent_tile_x = tile->tile_x / 2;
-    int parent_tile_y = tile->tile_y / 2;
     isyntax_level_t* parent_level = &wsi->levels[parent_tile_scale];
-    isyntax_tile_t* parent_tile = &parent_level->tiles[parent_level->width_in_tiles * parent_tile_y + parent_tile_x];
+    isyntax_tile_t* parent_tile = &parent_level->tiles[parent_level->width_in_tiles * (tile->tile_y / 2) + (tile->tile_x / 2)];
     if (parent_tile->exists && !parent_tile->cache_marked) {
-        tile_list_remove(cache_list, parent_tile);
-        parent_tile->cache_marked = true;
-        tile_list_insert_first(idwt_list, parent_tile);
+        reserve_tile(cache, parent_tile, idwt_set);
     }
 }
 
-static void isyntax_make_tile_lists_add_children_to_list(isyntax_t* isyntax, isyntax_tile_t* tile,
-                                                         isyntax_tile_list_t* children_list, isyntax_tile_list_t* cache_list) {
-    if (tile->tile_scale > 0) {
-        isyntax_tile_children_t children = isyntax_openslide_compute_children(isyntax, tile);
-        for (int i = 0; i < 4; ++i) {
-            if (!children.as_array[i]->cache_marked) {
-                tile_list_remove(cache_list, children.as_array[i]);
-                tile_list_insert_first(children_list, children.as_array[i]);
-            }
-        }
-    }
-}
-
-static void isyntax_make_tile_lists_by_scale(isyntax_t* isyntax, int start_scale,
-                                             isyntax_tile_list_t* idwt_list,
-                                             isyntax_tile_list_t* coeff_list,
-                                             isyntax_tile_list_t* children_list,
-                                             isyntax_tile_list_t* cache_list) {
+// Mutex held. Same traversal as the original single-threaded list builder: per scale, the neighbours of the IDWT tiles
+// need coefficients, and the parents of both groups need an IDWT (which gives this scale its LL coefficients).
+// The arrays are in insertion order, i.e. idwt_set[0] is the requested tile and higher indices are higher scales.
+static void build_working_set(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* requested,
+                              tile_array_t* idwt_set, tile_array_t* coeff_set, tile_array_t* children_set) {
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
-    for (int scale = start_scale; scale <= wsi->max_scale; ++scale) {
-        // Mark all neighbors of idwt tiles at this level as requiring coefficients.
+    reserve_tile(cache, requested, idwt_set);
+    for (int scale = requested->tile_scale; scale <= wsi->max_scale; ++scale) {
         isyntax_level_t* level = &wsi->levels[scale];
-        for (ITERATE_TILE_LIST(tile, (*idwt_list))) {
-            if (tile->tile_scale == scale) {
-                for (int y_offset = -1; y_offset <= 1; ++y_offset) {
-                    for (int x_offset = -1; x_offset <= 1; ++ x_offset) {
-                        int neighbor_tile_x =  tile->tile_x + x_offset;
-                        int neighbor_tile_y = tile->tile_y + y_offset;
-                        if (neighbor_tile_x < 0 || neighbor_tile_x >= level->width_in_tiles ||
-                            neighbor_tile_y < 0 || neighbor_tile_y >= level->height_in_tiles) {
-                            continue;
-                        }
-
-                        isyntax_tile_t* neighbor_tile = &level->tiles[level->width_in_tiles * neighbor_tile_y + neighbor_tile_x];
-                        if (neighbor_tile->cache_marked || !neighbor_tile->exists) {
-                            continue;
-                        }
-
-                        tile_list_remove(cache_list, neighbor_tile);
-                        neighbor_tile->cache_marked = true;
-                        tile_list_insert_first(coeff_list, neighbor_tile);
+        for (int i = 0; i < idwt_set->count; ++i) {
+            isyntax_tile_t* tile = idwt_set->items[i];
+            if (tile->tile_scale != scale) {
+                continue;
+            }
+            for (int y_offset = -1; y_offset <= 1; ++y_offset) {
+                for (int x_offset = -1; x_offset <= 1; ++x_offset) {
+                    int neighbor_tile_x = tile->tile_x + x_offset;
+                    int neighbor_tile_y = tile->tile_y + y_offset;
+                    if (neighbor_tile_x < 0 || neighbor_tile_x >= level->width_in_tiles ||
+                        neighbor_tile_y < 0 || neighbor_tile_y >= level->height_in_tiles) {
+                        continue;
                     }
+                    isyntax_tile_t* neighbor_tile = &level->tiles[level->width_in_tiles * neighbor_tile_y + neighbor_tile_x];
+                    if (neighbor_tile->cache_marked || !neighbor_tile->exists) {
+                        continue;
+                    }
+                    reserve_tile(cache, neighbor_tile, coeff_set);
                 }
             }
         }
-
-        // Mark all parents of tiles at this level as requiring idwt. This way all tiles at this level will get their
-        // ll coefficients.
-        for (ITERATE_TILE_LIST(tile, (*idwt_list))) {
-            if (tile->tile_scale == scale) {
-                isyntax_make_tile_lists_add_parent_to_list(isyntax, tile, idwt_list, cache_list);
+        for (int i = 0; i < idwt_set->count; ++i) {
+            if (idwt_set->items[i]->tile_scale == scale) {
+                reserve_parent(cache, isyntax, idwt_set->items[i], idwt_set);
             }
         }
-        for (ITERATE_TILE_LIST(tile, (*coeff_list))) {
-            if (tile->tile_scale == scale) {
-                isyntax_make_tile_lists_add_parent_to_list(isyntax, tile, idwt_list, cache_list);
+        for (int i = 0; i < coeff_set->count; ++i) {
+            if (coeff_set->items[i]->tile_scale == scale) {
+                reserve_parent(cache, isyntax, coeff_set->items[i], idwt_set);
             }
         }
     }
-
-    // Add all children of idwt that were not yet handled. The children will have their ll coefficients written,
-    // and so should be cache bumped.
-    // TODO(avirodov): if we store the idwt result (ll of next level) in the tile instead of the children, this
-    //  would be unnecessary. But I'm not sure this is bad either.
-    for (ITERATE_TILE_LIST(tile, (*idwt_list))) {
-        isyntax_make_tile_lists_add_children_to_list(isyntax, tile, children_list, cache_list);
+    // Children of IDWT tiles receive LL coefficients; reserve them so that they are not evicted (or re-decoded by
+    // another thread) while being written.
+    for (int i = 0; i < idwt_set->count; ++i) {
+        isyntax_tile_t* tile = idwt_set->items[i];
+        if (tile->tile_scale > 0) {
+            isyntax_tile_children_t children = isyntax_openslide_compute_children(isyntax, tile);
+            for (int c = 0; c < 4; ++c) {
+                if (!children.as_array[c]->cache_marked) {
+                    reserve_tile(cache, children.as_array[c], children_set);
+                }
+            }
+        }
     }
+    // The visit marks are shared between threads and only valid inside this critical section.
+    for (int i = 0; i < idwt_set->count; ++i)     { idwt_set->items[i]->cache_marked = false; }
+    for (int i = 0; i < coeff_set->count; ++i)    { coeff_set->items[i]->cache_marked = false; }
+    for (int i = 0; i < children_set->count; ++i) { children_set->items[i]->cache_marked = false; }
+}
+
+// Mutex held. Blocks until no other thread works on the tile.
+static void wait_for_tile(isyntax_cache_t* cache, isyntax_tile_t* tile) {
+    while (tile->reader_in_progress) {
+        platform_condition_variable_wait(&cache->cond, &cache->mutex);
+    }
+}
+
+// Mutex held. Loads the H (and top-level LL) coefficients of a tile unless they are already present. Returns false if
+// the tile's codeblocks could not be read or decoded (by this thread or earlier by another one).
+static bool ensure_tile_coefficients(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* tile) {
+    isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
+    if (!tile->exists) {
+        return true;
+    }
+    wait_for_tile(cache, tile);
+    bool needs_h = !tile->has_h;
+    // Test the scale first: has_ll of a lower tile may be written by its parent's IDWT on another thread right now.
+    bool needs_ll = tile->tile_scale == wsi->max_scale && !tile->has_ll;
+    if (needs_h || needs_ll) {
+        tile->reader_in_progress = true;
+        platform_mutex_unlock(&cache->mutex);
+        bool ok = isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
+        platform_mutex_lock(&cache->mutex);
+        if (!ok) {
+            tile->reader_failed = true;
+        }
+        tile->reader_in_progress = false;
+        platform_condition_variable_broadcast(&cache->cond);
+    }
+    return !tile->reader_failed;
+}
+
+// Mutex held. Runs the IDWT of a tile (writing its children's LL coefficients, and the pixels if requested) unless
+// its children already have their LL coefficients and no pixels are needed.
+static void ensure_tile_idwt(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* tile,
+                             uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format) {
+    wait_for_tile(cache, tile);
+    if (pixels_buffer == NULL) {
+        isyntax_tile_children_t children = isyntax_openslide_compute_children(isyntax, tile);
+        if (children.child_top_left->has_ll && children.child_top_right->has_ll &&
+            children.child_bottom_left->has_ll && children.child_bottom_right->has_ll) {
+            return;
+        }
+    }
+    tile->reader_in_progress = true;
+    platform_mutex_unlock(&cache->mutex);
+    isyntax_openslide_idwt(cache, isyntax, tile, pixels_buffer, pixel_format);
+    platform_mutex_lock(&cache->mutex);
+    tile->reader_in_progress = false;
+    platform_condition_variable_broadcast(&cache->cond);
+}
+
+// Mutex held. Drops this thread's reservations; tiles nobody else uses go to the front of the LRU list.
+static void release_set(isyntax_cache_t* cache, tile_array_t* set) {
+    for (int i = 0; i < set->count; ++i) {
+        isyntax_tile_t* tile = set->items[i];
+        if (--tile->reader_refcount == 0) {
+            tile_list_insert_first(&cache->cache_list, tile);
+        }
+    }
+    free(set->items);
 }
 
 bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
                        uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format) {
-    // TODO(avirodov): more granular locking (some notes below). This will require handling overlapping work, that is
-    //  thread A needing tile 123 and started to load it, and thread B needing same tile 123 and needs to wait for A.
-    // TODO(pvalkema): Can we safely lock the mutex later, after checking if the tile exists?
-    platform_mutex_lock(&cache->mutex);
-
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
     isyntax_level_t* level = &wsi->levels[scale];
 
-	if (!(tile_x >= 0 && tile_x < level->width_in_tiles && tile_y >= 0 && tile_y < level->height_in_tiles)) {
-		// Read out of bounds -> set to all white
-		memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
-        platform_mutex_unlock(&cache->mutex);
-		return true;
-	}
-
-    isyntax_tile_t *tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
-    // printf("=== isyntax_openslide_load_tile scale=%d tile_x=%d tile_y=%d\n", scale, tile_x, tile_y);
+    if (!(tile_x >= 0 && tile_x < level->width_in_tiles && tile_y >= 0 && tile_y < level->height_in_tiles)) {
+        // Read out of bounds -> set to all white
+        memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
+        return true;
+    }
+    isyntax_tile_t* tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
     if (!tile->exists) {
         memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
-        platform_mutex_unlock(&cache->mutex);
         return true;
     }
 
-    // Need 3 lists:
-    // 1. idwt list - those tiles will have to perform an idwt for their children to get ll coeffs. Primary cache bump.
-    // 2. coeff list - those tiles are neighbors and will need to have coefficients loaded. Secondary cache bump.
-    // 3. children list - those tiles will have their ll coeffs loaded as a side effect. Tertiary cache bump.
-    // Those lists must be disjoint, and sorted such that parents are closer to head than children.
-    isyntax_tile_list_t idwt_list = {NULL, NULL, 0, "idwt_list"};
-    isyntax_tile_list_t coeff_list = {NULL, NULL, 0, "coeff_list"};
-    isyntax_tile_list_t children_list = {NULL, NULL, 0, "children_list"};
-
-    // Lock.
-    // Make a list of all dependent tiles (including the required one).
-    // Mark all dependent tiles as "reserved" so that they are not evicted by other threads as we load them.
-    // Unlock.
-    {
-        tile_list_remove(&cache->cache_list, tile);
-        tile->cache_marked = true;
-        tile_list_insert_first(&idwt_list, tile);
-    }
-    isyntax_make_tile_lists_by_scale(isyntax, scale, &idwt_list, &coeff_list, &children_list, &cache->cache_list);
-
-    // Unmark visit status and reserve all nodes. todo(avirodov): reserve later when doing threading.
-    for (ITERATE_TILE_LIST(tile, idwt_list))     { tile->cache_marked = false; /*printf("@@@ idwt_list tile scale=%d x=%d y=%d\n", tile->tile_scale, tile->tile_x, tile->tile_y);*/ }
-    for (ITERATE_TILE_LIST(tile, coeff_list))    { tile->cache_marked = false; /*printf("@@@ coeff_list tile scale=%d x=%d y=%d\n", tile->tile_scale, tile->tile_x, tile->tile_y);*/ }
-    for (ITERATE_TILE_LIST(tile, children_list)) { tile->cache_marked = false; /*printf("@@@ children_list tile scale=%d x=%d y=%d\n", tile->tile_scale, tile->tile_x, tile->tile_y);*/ }
-
-    // IO+decode: For all dependent tiles, read and decode coefficients where missing (hh, and ll for top tiles).
-    // Assuming lists are sorted parents first.
-    // IDWT as needed, top to bottom. This should produce idwt for this tile as well, which should be last in idwt list.
-    // YCoCb->RGB for this tile only.
-    // On a decode error the affected tiles hold zero coefficients; finish the bookkeeping below and report it.
+    tile_array_t idwt_set = {0};
+    tile_array_t coeff_set = {0};
+    tile_array_t children_set = {0};
     bool success = true;
-    for (ITERATE_TILE_LIST(tile, coeff_list)) {
-        success &= isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
+
+    platform_mutex_lock(&cache->mutex);
+    build_working_set(cache, isyntax, tile, &idwt_set, &coeff_set, &children_set);
+
+    // Coefficients for every tile that feeds an IDWT.
+    for (int i = 0; i < coeff_set.count; ++i) {
+        success &= ensure_tile_coefficients(cache, isyntax, coeff_set.items[i]);
     }
-    for (ITERATE_TILE_LIST(tile, idwt_list)) {
-        success &= isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
-    }
-    for (ITERATE_TILE_LIST(tile, idwt_list)) {
-        if (tile == idwt_list.tail) {
-            isyntax_openslide_idwt(cache, isyntax, tile, pixels_buffer, pixel_format);
-        } else {
-            isyntax_openslide_idwt(cache, isyntax, tile, /*pixels_buffer=*/NULL, /*pixel_format=*/0);
-        }
+    for (int i = 0; i < idwt_set.count; ++i) {
+        success &= ensure_tile_coefficients(cache, isyntax, idwt_set.items[i]);
     }
 
-    // Lock.
-    // Bump all the affected tiles in cache.
-    // Unmark all dependent tiles as "referenced" so that they can be evicted.
-    // Perform cache trim (possibly not every invocation).
-    // Unlock.
+    // IDWT from the top level down: each one provides the LL coefficients of the next level. The requested tile
+    // (idwt_set[0]) is last and also produces the pixels.
+    for (int i = idwt_set.count - 1; i >= 0; --i) {
+        bool is_requested = (i == 0);
+        ensure_tile_idwt(cache, isyntax, idwt_set.items[i],
+                         is_requested ? pixels_buffer : NULL, is_requested ? pixel_format : 0);
+    }
 
-    tile_list_insert_list_first(&cache->cache_list, &children_list);
-    tile_list_insert_list_first(&cache->cache_list, &coeff_list);
-    tile_list_insert_list_first(&cache->cache_list, &idwt_list);
+    // Bump all the affected tiles in the cache (same LRU order as before: IDWT tiles first, then neighbours, then
+    // children), then trim. Tiles still reserved by other threads are left out of the list until they release them.
+    release_set(cache, &children_set);
+    release_set(cache, &coeff_set);
+    release_set(cache, &idwt_set);
 
-    // Cache trim. Since we have the result already, it is possible that tiles from this run will be trimmed here
-    // if cache is small or work happened on other threads.
-    // TODO(avirodov): later will need to skip tiles that are reserved by other threads.
     while (cache->cache_list.count > cache->target_cache_size) {
-        isyntax_tile_t* tile = cache->cache_list.tail;
-        tile_list_remove(&cache->cache_list, tile);
+        isyntax_tile_t* evicted = cache->cache_list.tail;
+        tile_list_remove(&cache->cache_list, evicted);
         for (int i = 0; i < 3; ++i) {
-            if (tile->has_ll) {
-                block_free(cache->ll_coeff_block_allocator, tile->color_channels[i].coeff_ll);
-                tile->color_channels[i].coeff_ll = NULL;
+            if (evicted->has_ll) {
+                block_free(cache->ll_coeff_block_allocator, evicted->color_channels[i].coeff_ll);
+                evicted->color_channels[i].coeff_ll = NULL;
             }
-            if (tile->has_h) {
-                block_free(cache->h_coeff_block_allocator, tile->color_channels[i].coeff_h);
-                tile->color_channels[i].coeff_h = NULL;
+            if (evicted->has_h) {
+                block_free(cache->h_coeff_block_allocator, evicted->color_channels[i].coeff_h);
+                evicted->color_channels[i].coeff_h = NULL;
             }
         }
-        tile->has_ll = false;
-        tile->has_h = false;
+        evicted->has_ll = false;
+        evicted->has_h = false;
+        evicted->reader_failed = false;
     }
 
     // Prevent iSyntax streamer from calling isyntax_begin_first_load()
     if (!wsi->first_load_complete) {
         wsi->first_load_complete = true;
     }
-
     platform_mutex_unlock(&cache->mutex);
     return success;
 }

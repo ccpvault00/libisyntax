@@ -267,6 +267,10 @@ typedef struct isyntax_tile_t {
     bool cache_marked;
     struct isyntax_tile_t* cache_next;
     struct isyntax_tile_t* cache_prev;
+    // Concurrency (isyntax_reader): all three are only touched with isyntax_cache_t.mutex held.
+    int reader_refcount;        // threads whose working set contains this tile; > 0 keeps it out of the LRU list
+    bool reader_in_progress;    // a thread is loading coefficients or running the IDWT for this tile (outside the lock)
+    bool reader_failed;         // its codeblocks could not be read/decoded (zero coefficients were substituted)
 
     // Note(avirodov): this is needed for isyntax_reader. It is very convenient to be able to compute neighbors
     // from the tile itself, although at the cost of additional memory (3 ints) per tile.

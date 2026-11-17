@@ -2317,7 +2317,11 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
 		isyntax_tile_t* child_bottom_left = child_top_left + next_level->width_in_tiles;
 		isyntax_tile_t* child_bottom_right = child_bottom_left + 1;
 
-		// TODO(avirodov): instead of releasing here, skip copy if still allocated.
+		// A child that already has its LL coefficients keeps them: the IDWT of this tile is deterministic, so a
+		// rewrite would copy the same values, and it would race with other threads reading that child.
+		if (child_top_left->has_ll && child_top_right->has_ll && child_bottom_left->has_ll && child_bottom_right->has_ll) {
+			continue;
+		}
 		if (child_top_left->color_channels[color].coeff_ll) {
 			block_free(ll_coeff_block_allocator, child_top_left->color_channels[color].coeff_ll);
 		}
@@ -2428,7 +2432,7 @@ void isyntax_load_tile(isyntax_t* isyntax, isyntax_image_t* wsi, i32 scale, i32 
             ASSERT(!"unknown pixel format!");
             break;
     }
-	isyntax->total_rgb_transform_time += get_seconds_elapsed(start, get_clock());
+	(void)start; // (profiling counter removed: isyntax_load_tile() may run on several threads at once)
 
 	//		float elapsed_rgb = get_seconds_elapsed(start, get_clock());
 	//	console_print_verbose("load: scale=%d x=%d y=%d  idwt time =%g  rgb transform time=%g  malloc time=%g\n", scale, tile_x, tile_y, elapsed_idwt, elapsed_rgb, elapsed_malloc);
