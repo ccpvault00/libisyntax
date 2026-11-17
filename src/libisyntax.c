@@ -368,7 +368,9 @@ isyntax_error_t libisyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* isynta
 
     // TODO(avirodov): if isyntax_cache is null, we can support using allocators that are in isyntax object,
     //  if is_init_allocators = 1 when created. Not sure is needed.
-    isyntax_tile_read(isyntax, isyntax_cache, level, tile_x, tile_y, pixels_buffer, pixel_format);
+    if (!isyntax_tile_read(isyntax, isyntax_cache, level, tile_x, tile_y, pixels_buffer, pixel_format)) {
+        return LIBISYNTAX_FATAL;
+    }
     return LIBISYNTAX_OK;
 }
 

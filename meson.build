@@ -152,4 +152,12 @@ if get_option('tests')
     )
     test('smoke_thread_test', thread_test)
   endif
+
+  # Damaged copies of the test slide must come back with an error code, never abort or hang.
+  corrupt_input_test = executable(
+    'corrupt_input_test',
+    'test/corrupt_input_test.c',
+    dependencies : [libisyntax_dep],
+  )
+  test('corrupt_input_test', corrupt_input_test, args : [testslide, meson.current_build_dir()], timeout : 600)
 endif

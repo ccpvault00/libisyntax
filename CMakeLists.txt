@@ -169,6 +169,12 @@ if(BUILD_TESTING)
                 COMMAND thread_test)
     endif()
 
+    # Damaged copies of the test slide must come back with an error code, never abort or hang.
+    add_executable(corrupt_input_test test/corrupt_input_test.c)
+    target_link_libraries(corrupt_input_test isyntax)
+    add_test(NAME corrupt_input_test
+            COMMAND corrupt_input_test ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/testslide.isyntax ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+
 
 endif() # if(BUILD_TESTING)
 

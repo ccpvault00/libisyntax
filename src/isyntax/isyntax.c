@@ -754,9 +754,15 @@ static bool isyntax_parse_scannedimage_child_node(isyntax_t* isyntax, u32 group,
 					u8* decoded = isyntax_base64_decode(value, value_len, &decoded_len);
 					if (decoded) {
 
-						u32 header_size = isyntax_read_u32_le(decoded);
+						u32 header_size = (decoded_len >= 4) ? isyntax_read_u32_le(decoded) : 0;
 						u8* block_header_start = decoded + 4;
-						isyntax_dicom_tag_header_t sequence_element = isyntax_read_dicom_tag_header(block_header_start);
+						isyntax_dicom_tag_header_t sequence_element = {0};
+						if (decoded_len < 12 || (u64)header_size + 4 > decoded_len) {
+							console_print_error("iSyntax: block header table (%u bytes) does not fit in its %zu decoded bytes\n", header_size, decoded_len);
+							success = false; // sequence_element.size stays 0: nothing is parsed below and the open fails
+						} else {
+							sequence_element = isyntax_read_dicom_tag_header(block_header_start);
+						}
 						if (sequence_element.size == 40) {
 							// We have a partial header structure, with 'Block Data Offset' and 'Block Size' missing (stored in Seektable)
 							// Full block header size (including the sequence element) is 48 bytes
@@ -957,7 +963,10 @@ static bool isyntax_parse_scannedimage_child_node(isyntax_t* isyntax, u32 group,
 							i32 top_codeblock_index = running_codeblock_index;
 							bool has_ll = false;
 							i32 highest_scale = 0;
-							ASSERT(running_codeblock_index + block_count <= image->codeblock_count);
+							if ((i64)running_codeblock_index + block_count > image->codeblock_count || block_count > MAX_CODEBLOCKS_PER_CLUSTER) {
+								console_print_error("iSyntax: cluster header table has more codeblocks (%u) than the header announced\n", block_count);
+								goto decoding_cluster_header_table_failed;
+							}
 							for (i32 j = 0; j < block_count; ++j) {
 								isyntax_codeblock_t* codeblock = image->codeblocks + running_codeblock_index;
 								isyntax_cluster_relative_coords_t* relative_codeblock_in_cluster_info = cluster_header_template->relative_coords_for_codeblock_in_cluster + j;
@@ -2614,16 +2623,23 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 	if (serialized_length > 2 * coeff_buffer_size) {
 //		dump_block(compressed, compressed_size);
 		console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, serialized_length too large (%lld)\n", serialized_length);
-		ASSERT(!"serialized_length too large");
-		memset(out_buffer, 0, coeff_buffer_size);
-		release_temp_memory(&temp_memory);
-		return false;
+		goto failed;
+	}
+	if (serialized_length <= 0) {
+		// Empty blocks are stored with compressed_size <= 8 (handled above); a longer block announcing no
+		// payload is corrupt (e.g. zeroed file regions, on which the Huffman tree read below would never end).
+		console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, no payload in %zu bytes\n", compressed_size);
+		goto failed;
 	}
 
 	u8 zerorun_symbol = *(u8*)byte_pos++;
 	bits_read += 8;
 	u8 zero_counter_size = *(u8*)byte_pos++;
 	bits_read += 8;
+	if (zero_counter_size >= 32) {
+		console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, zero run counter size %d\n", zero_counter_size);
+		goto failed;
+	}
 
 	u32 bitplane_offsets[16] = {0};
 	if (compressor_version >= 2) {
@@ -2655,10 +2671,7 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 			if (bits_read >= block_size_in_bits) {
 //				dump_block(compressed, compressed_size);
 				console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, Huffman table extends out of bounds (compressed_size=%zu)\n", compressed_size);
-				ASSERT(!"out of bounds");
-				memset(out_buffer, 0, coeff_buffer_size);
-				release_temp_memory(&temp_memory);
-				return false;
+				goto failed;
 			}
 			// Read a chunk of bits large enough to 'always' have the whole Huffman code, followed by the 8-bit symbol.
 			// A blob of 57-64 bits is more than sufficient for a Huffman code of at most 16 bits.
@@ -2675,6 +2688,11 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 				blob >>= 1;
 				is_leaf = (blob & 1);
 				++code_size;
+				if (code_size > 16) {
+					// Codes are at most 16 bits (size_bitmasks); an all-zero blob would otherwise loop forever.
+					console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, Huffman code longer than 16 bits\n");
+					goto failed;
+				}
 			}
 			blob >>= 1;
 
@@ -2692,6 +2710,10 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 				// Prepare the slow method for decoding Huffman codes that are too large to fit in the fast lookup table.
 				// (Slow method = iterating over possible symbols and checking if they match)
 				// Value being >= 256 in the 'fast' lookup table is the hint that we need the slow method.
+				if (nonfast_symbol_index >= 256) {
+					console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, too many Huffman symbols\n");
+					goto failed;
+				}
 				u32 prefix = code & fast_mask;
 				u16 old_fast_data = huffman.fast[prefix];
 				u8 old_lowest_symbol_index = old_fast_data & 0xFF;
@@ -2738,7 +2760,7 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 	if (zerorun_code_size == 0) zerorun_code_size = 1; // handle special case of the 'empty' Huffman tree (root node is leaf node)
 	u32 zerorun_code_mask = (1 << zerorun_code_size) - 1;
 
-	u32 zero_counter_mask = (1 << zero_counter_size) - 1;
+	u32 zero_counter_mask = (1u << zero_counter_size) - 1;
 	i32 decompressed_length = 0;
 	while (bits_read < block_size_in_bits) {
 		if (decompressed_length >= serialized_length || bits_read >= block_size_in_bits) {
@@ -2795,10 +2817,7 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 			if (!match) {
 //				dump_block(compressed, compressed_size);
 				console_print_error("Error: isyntax_hulsken_decompress(): error decoding Huffman message (unknown symbol)\n");
-				ASSERT(!"unknown symbol");
-				memset(out_buffer, 0, coeff_buffer_size);
-				release_temp_memory(&temp_memory);
-				return false;
+				goto failed;
 			}
 		}
 
@@ -2861,11 +2880,14 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 
 	}
 
-	if (serialized_length != decompressed_length) {
+	if (decompressed_length > serialized_length) {
+		// The final zero run may overshoot; the excess was never written (clamped above).
+		decompressed_length = serialized_length;
+	} else if (decompressed_length < serialized_length) {
 //		dump_block(compressed, compressed_size);
-		console_print("iSyntax: decompressed size mismatch (size=%zu): expected %lld observed %d\n",
+		console_print_error("iSyntax: decompressed size mismatch (size=%zu): expected %lld observed %d\n",
 				 compressed_size, serialized_length, decompressed_length);
-		ASSERT(!"size mismatch");
+		goto failed;
 	}
 
 	i32 bytes_per_bitplane = (block_width * block_height) / 8;
@@ -2889,6 +2911,10 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 		// If there are empty bitplanes: bitmasks stored at end of data
 		u64 expected_length = total_mask_bits * bytes_per_bitplane;
 		if (decompressed_length < expected_length) {
+			if (decompressed_length < coeff_count * 2) {
+				console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, no room for the bitmasks\n");
+				goto failed;
+			}
 			if (coeff_count == 1) {
 				bitmasks[0] = read_u16_le(decompressed_buffer + decompressed_length - 2);
 				total_mask_bits = popcount(bitmasks[0]);
@@ -2902,8 +2928,18 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 				fatal_error("invalid coeff_count");
 			}
 			expected_length = (total_mask_bits * block_width * block_height) / 8 + (coeff_count * 2);
-			ASSERT(decompressed_length == expected_length);
+			if ((u64)decompressed_length != expected_length) {
+				console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, %d decompressed bytes but the bitmasks announce %llu\n",
+				                    decompressed_length, expected_length);
+				goto failed;
+			}
 		}
+	}
+
+	if ((i64)total_mask_bits * bytes_per_bitplane > decompressed_length) {
+		console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, %d bitplanes do not fit in %d decompressed bytes\n",
+		                    total_mask_bits, decompressed_length);
+		goto failed;
 	}
 
 	// unpack bitplanes
@@ -2929,7 +2965,8 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 				// find next bit for current coeff
 				for (;;) {
 					if (running_coeff_index >= coeff_count) {
-						fatal_error("too many bitplanes");
+						console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, too many bitplanes\n");
+						goto failed;
 					}
 					u16 bitmask = bitmasks_copy[running_coeff_index];
 					if (bitmask) {
@@ -2945,7 +2982,8 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 				// compressor version 2: alternating coefficients
 				for (;;) {
 					if (running_bit_index >= 16) {
-						fatal_error("too many bitplanes");
+						console_print_error("Error: isyntax_hulsken_decompress(): invalid codeblock, too many bitplanes\n");
+						goto failed;
 					}
 					if (running_coeff_index < coeff_count) {
 						u16 bitmask = bitmasks_copy[running_coeff_index];
@@ -3042,6 +3080,12 @@ bool isyntax_hulsken_decompress(u8* compressed, size_t compressed_size, i32 bloc
 
 	release_temp_memory(&temp_memory); // frees coeff_buffer and decompressed_buffer
 	return true;
+
+failed:
+	// Invalid or truncated codeblock: hand back zero coefficients and let the caller report the error.
+	memset(out_buffer, 0, coeff_buffer_size);
+	release_temp_memory(&temp_memory);
+	return false;
 }
 
 static inline i32 get_first_valid_coef_pixel(i32 scale) {
@@ -3256,9 +3300,25 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 				i32 tile_height = isyntax->tile_height;
 
 				i32 num_levels = wsi_image->level_count;
-				ASSERT(num_levels >= 1);
-				i32 grid_width = ((wsi_image->width_including_padding + (block_width << num_levels) - 1) / (block_width << num_levels)) << (num_levels - 1);
-				i32 grid_height = ((wsi_image->height_including_padding + (block_height << num_levels) - 1) / (block_height << num_levels)) << (num_levels - 1);
+				if (num_levels < 1 || num_levels > (i32)COUNT(wsi_image->levels)) {
+					console_print_error("iSyntax: invalid number of levels (%d)\n", num_levels);
+					goto failed;
+				}
+				// The codeblock size comes from the header too; keep the divisions below defined, the shifts in range and the
+				// decoder's 4x4 / 8-pixel block assumptions valid.
+				if (block_width < 16 || block_height < 16 || block_width > 4096 || block_height > 4096 || (block_width % 16) != 0 || (block_height % 16) != 0) {
+					console_print_error("iSyntax: unsupported codeblock size %d x %d\n", block_width, block_height);
+					goto failed;
+				}
+				i64 grid_width_64 = ((i64)wsi_image->width_including_padding + ((i64)block_width << num_levels) - 1) / ((i64)block_width << num_levels) << (num_levels - 1);
+				i64 grid_height_64 = ((i64)wsi_image->height_including_padding + ((i64)block_height << num_levels) - 1) / ((i64)block_height << num_levels) << (num_levels - 1);
+				// Tile counts are stored as i32 (the header dimensions are file-controlled).
+				if (grid_width_64 <= 0 || grid_height_64 <= 0 || grid_width_64 * grid_height_64 > INT32_MAX) {
+					console_print_error("iSyntax: unsupported tile grid %lld x %lld\n", grid_width_64, grid_height_64);
+					goto failed;
+				}
+				i32 grid_width = (i32)grid_width_64;
+				i32 grid_height = (i32)grid_height_64;
 
 				u64 h_coeff_tile_count = 0; // number of tiles with LH/HL/HH coefficients
 				i32 base_level_tile_count = grid_height * grid_width;
@@ -3305,6 +3365,11 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 					codeblock->x_adjusted = (i32)codeblock->x_coordinate - wsi_image->offset_x;
 					codeblock->y_adjusted = (i32)codeblock->y_coordinate - wsi_image->offset_y;
 
+					if (codeblock->scale >= (u32)num_levels || codeblock->color_component >= 3 || codeblock->coefficient > 1) {
+						console_print_error("iSyntax: codeblock %d has invalid scale %u, color component %u or coefficient %u\n", i, codeblock->scale, codeblock->color_component, codeblock->coefficient);
+						goto failed;
+					}
+
 					// Calculate the block ID (= index into the seektable)
 					// adapted from extract_block_header.py
 					bool is_ll = codeblock->coefficient == 0;
@@ -3350,11 +3415,17 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 						i32 seektable_size = seektable_header_tag.size;
 						if (seektable_size < 0) {
 							// We need to guess the size...
-							ASSERT(wsi_image->codeblock_count > 0);
 							seektable_size = sizeof(isyntax_seektable_codeblock_header_t) * wsi_image->codeblock_count;
 						}
+						if (seektable_size <= 0 || wsi_image->codeblock_count <= 0) {
+							console_print_error("iSyntax: invalid seektable size (%d) or codeblock count (%d)\n", seektable_size, wsi_image->codeblock_count);
+							goto failed;
+						}
 						seektable = (isyntax_seektable_codeblock_header_t*) malloc(seektable_size);
-						file_stream_read(seektable, seektable_size, fp);
+						if (file_stream_read(seektable, seektable_size, fp) != seektable_size) {
+							console_print_error("iSyntax: unexpected end of file while reading the seektable\n");
+							goto failed;
+						}
 
 						// Now fill in the missing data.
 						// NOTE: The number of codeblock entries in the seektable is much greater than the number of
@@ -3366,14 +3437,16 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 
 						for (i32 i = 0; i < wsi_image->codeblock_count; ++i) {
 							isyntax_codeblock_t* codeblock = wsi_image->codeblocks + i;
-							if (codeblock->block_id > seektable_entry_count) {
-								ASSERT(!"block ID out of bounds");
+							if (codeblock->block_id >= (u64)seektable_entry_count) {
+								console_print_error("iSyntax: codeblock %d has block ID %llu outside the seektable (%d entries)\n", i, codeblock->block_id, seektable_entry_count);
 								goto failed;
 							}
 							u8* seektable_entry = (u8*)(seektable + codeblock->block_id);
 							isyntax_dicom_tag_header_t block_data_offset_header = isyntax_read_dicom_tag_header(seektable_entry + offsetof(isyntax_seektable_codeblock_header_t, block_data_offset_header));
-							ASSERT(block_data_offset_header.group == 0x301D);
-							ASSERT(block_data_offset_header.element == 0x2010);
+							if (block_data_offset_header.group != 0x301D || block_data_offset_header.element != 0x2010) {
+								console_print_error("iSyntax: seektable entry %llu is corrupt (tag %04x,%04x)\n", codeblock->block_id, block_data_offset_header.group, block_data_offset_header.element);
+								goto failed;
+							}
 							codeblock->block_data_offset = isyntax_read_u64_le(seektable_entry + offsetof(isyntax_seektable_codeblock_header_t, block_data_offset));
 							codeblock->block_size = isyntax_read_u64_le(seektable_entry + offsetof(isyntax_seektable_codeblock_header_t, block_size));
 
@@ -3455,7 +3528,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 								current_data_chunk_index = next_data_chunk_index;
 								if (current_data_chunk_index >= max_possible_chunk_count) {
 									console_print_error("iSyntax: encountered too many data chunks\n");
-									fatal_error();
+									goto failed;
 								}
 
 								isyntax_data_chunk_t* chunk = wsi_image->data_chunks + current_data_chunk_index;
@@ -3469,7 +3542,10 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 							}
 							isyntax_level_t* level = wsi_image->levels + codeblock->scale;
 							i32 tile_index = codeblock->block_y * level->width_in_tiles + codeblock->block_x;
-							ASSERT(tile_index < level->tile_count);
+							if (tile_index < 0 || (u64)tile_index >= level->tile_count) {
+								console_print_error("iSyntax: codeblock %d maps to tile %d outside level %u (%llu tiles)\n", i, tile_index, codeblock->scale, level->tile_count);
+								goto failed;
+							}
 							level->tiles[tile_index].exists = true;
 							level->tiles[tile_index].codeblock_index = i;
 							level->tiles[tile_index].codeblock_chunk_index = current_chunk_codeblock_index;
@@ -3521,7 +3597,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 							current_data_chunk_index = next_data_chunk_index;
 							if (current_data_chunk_index >= wsi_image->data_chunk_count) {
 								console_print_error("iSyntax: encountered too many data chunks\n");
-								fatal_error();
+								goto failed;
 							}
 
 							if (isyntax->data_model_major_version < 100) {
@@ -3538,7 +3614,10 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 						}
 						isyntax_level_t* level = wsi_image->levels + codeblock->scale;
 						i32 tile_index = codeblock->block_y * level->width_in_tiles + codeblock->block_x;
-						ASSERT(tile_index < level->tile_count);
+						if (tile_index < 0 || (u64)tile_index >= level->tile_count) {
+							console_print_error("iSyntax: codeblock %d maps to tile %d outside level %u (%llu tiles)\n", i, tile_index, codeblock->scale, level->tile_count);
+							goto failed;
+						}
 						level->tiles[tile_index].exists = true;
 						level->tiles[tile_index].codeblock_index = i;
 						level->tiles[tile_index].codeblock_chunk_index = current_chunk_codeblock_index;

@@ -99,37 +99,53 @@ static void tile_list_insert_list_first(isyntax_tile_list_t* target_list, isynta
     isyntax_tile_t* _iter = _list.head; _iter; _iter = _iter->cache_next
 
 
-static void isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* cache,
+// Returns false if a codeblock could not be read or decoded. The tile is still marked as loaded (with zero
+// coefficients) so that the cache stays consistent; the caller is expected to report the error.
+static bool isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* cache,
                                                              isyntax_t* isyntax, isyntax_tile_t* tile,
                                                              int codeblock_index, bool is_ll) {
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
     isyntax_data_chunk_t* chunk = &wsi->data_chunks[tile->data_chunk_index];
+    bool success = true;
 
     for (int color = 0; color < 3; ++color) {
-        isyntax_codeblock_t* codeblock = &wsi->codeblocks[codeblock_index + color * chunk->codeblock_count_per_color];
-        ASSERT(codeblock->coefficient == (is_ll ? 0 : 1)); // LL coefficient codeblock for this tile.
-        // TODO(avirodov): int vs i32 vs u32 consistently.
-        ASSERT(codeblock->color_component == (u32)color);
-        ASSERT(codeblock->scale == (u32)tile->tile_scale);
+        i64 index = (i64)codeblock_index + (i64)color * chunk->codeblock_count_per_color;
+        isyntax_codeblock_t* codeblock = index >= 0 && index < wsi->codeblock_count ? &wsi->codeblocks[index] : NULL;
         if (is_ll) {
             tile->color_channels[color].coeff_ll = (icoeff_t *) block_alloc(cache->ll_coeff_block_allocator);
         } else {
             tile->color_channels[color].coeff_h = (icoeff_t *) block_alloc(cache->h_coeff_block_allocator);
         }
+        icoeff_t* out_buffer = is_ll ? tile->color_channels[color].coeff_ll : tile->color_channels[color].coeff_h;
+        // The output buffer holds 1 (LL) or 3 (LH/HL/HH) coefficient blocks; the decoder writes as many as the
+        // codeblock's own kind says, so a header that mislabels a block must not reach it.
+        if (!codeblock || codeblock->coefficient != (is_ll ? 0u : 1u) || codeblock->color_component != (u32)color ||
+            codeblock->scale != (u32)tile->tile_scale) {
+            console_print_error("Error: iSyntax codeblock table does not match tile (scale %d, %d,%d) color %d\n",
+                                tile->tile_scale, tile->tile_x, tile->tile_y, color);
+            memset(out_buffer, 0, (is_ll ? 1 : 3) * isyntax->block_width * isyntax->block_height * sizeof(icoeff_t));
+            success = false;
+            continue;
+        }
         // TODO(avirodov): fancy allocators, for multiple sequential blocks (aka chunk). Or let OS do the caching.
         // Adding 7 safety bytes so bitstream_lsb_read() won't access out of bounds in isyntax_hulsken_decompress().
-        u8* codeblock_data = malloc(codeblock->block_size + 7);
+        // They are zero-initialised: the 64-bit reads at the end of the block pull them in (valgrind otherwise
+        // reports uninitialised values; the decoded symbols never depend on them).
+        u8* codeblock_data = calloc(codeblock->block_size + 7, 1);
         size_t bytes_read = file_handle_read_at_offset(codeblock_data, isyntax->file_handle,
                                                        codeblock->block_data_offset, codeblock->block_size);
-        if (!(bytes_read > 0)) {
-            console_print_error("Error: could not read iSyntax data at offset %lld (read size %lld)\n",
+        if (bytes_read != codeblock->block_size) {
+            console_print_error("Error: could not read iSyntax data at offset %lld (read size %lld, got %zu)\n",
+                                codeblock->block_data_offset, codeblock->block_size, bytes_read);
+            memset(out_buffer, 0, (is_ll ? 1 : 3) * isyntax->block_width * isyntax->block_height * sizeof(icoeff_t));
+            success = false;
+        } else if (!isyntax_hulsken_decompress(codeblock_data, codeblock->block_size,
+                                               isyntax->block_width, isyntax->block_height,
+                                               codeblock->coefficient, wsi->compressor_version, out_buffer)) {
+            console_print_error("Error: could not decode iSyntax codeblock at offset %lld (size %lld)\n",
                                 codeblock->block_data_offset, codeblock->block_size);
+            success = false;
         }
-
-        isyntax_hulsken_decompress(codeblock_data, codeblock->block_size,
-                                   isyntax->block_width, isyntax->block_height,
-                                   codeblock->coefficient, wsi->compressor_version,
-                                   is_ll ? tile->color_channels[color].coeff_ll : tile->color_channels[color].coeff_h);
         free(codeblock_data);
     }
 
@@ -138,19 +154,21 @@ static void isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* ca
     } else {
         tile->has_h = true;
     }
+    return success;
 }
 
-static void isyntax_openslide_load_tile_coefficients(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* tile) {
+static bool isyntax_openslide_load_tile_coefficients(isyntax_cache_t* cache, isyntax_t* isyntax, isyntax_tile_t* tile) {
     isyntax_image_t* wsi = &isyntax->images[isyntax->wsi_image_index];
+    bool success = true;
 
     if (!tile->exists) {
-        return;
+        return true;
     }
 
     // Load LL codeblocks here only for top-level tiles. For other levels, the LL coefficients are computed from parent
     // tiles later on.
     if (!tile->has_ll && tile->tile_scale == wsi->max_scale) {
-        isyntax_openslide_load_tile_coefficients_ll_or_h(
+        success &= isyntax_openslide_load_tile_coefficients_ll_or_h(
                 cache, isyntax, tile, /*codeblock_index=*/tile->codeblock_index, /*is_ll=*/true);
     }
 
@@ -171,10 +189,11 @@ static void isyntax_openslide_load_tile_coefficients(isyntax_cache_t* cache, isy
             fatal_error();
         }
 
-        isyntax_openslide_load_tile_coefficients_ll_or_h(
+        success &= isyntax_openslide_load_tile_coefficients_ll_or_h(
                 cache, isyntax, tile,
                 /*codeblock_index=*/tile->codeblock_chunk_index + codeblock_index_in_chunk, /*is_ll=*/false);
     }
+    return success;
 }
 
 typedef union isyntax_tile_children_t {
@@ -323,7 +342,7 @@ static void isyntax_make_tile_lists_by_scale(isyntax_t* isyntax, int start_scale
     }
 }
 
-void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
+bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
                        uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format) {
     // TODO(avirodov): more granular locking (some notes below). This will require handling overlapping work, that is
     //  thread A needing tile 123 and started to load it, and thread B needing same tile 123 and needs to wait for A.
@@ -337,7 +356,7 @@ void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
 		// Read out of bounds -> set to all white
 		memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
         platform_mutex_unlock(&cache->mutex);
-		return;
+		return true;
 	}
 
     isyntax_tile_t *tile = &level->tiles[level->width_in_tiles * tile_y + tile_x];
@@ -345,7 +364,7 @@ void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
     if (!tile->exists) {
         memset(pixels_buffer, 0xff, isyntax->tile_width * isyntax->tile_height * 4);
         platform_mutex_unlock(&cache->mutex);
-        return;
+        return true;
     }
 
     // Need 3 lists:
@@ -377,12 +396,13 @@ void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
     // Assuming lists are sorted parents first.
     // IDWT as needed, top to bottom. This should produce idwt for this tile as well, which should be last in idwt list.
     // YCoCb->RGB for this tile only.
-    uint32_t* result = NULL;
+    // On a decode error the affected tiles hold zero coefficients; finish the bookkeeping below and report it.
+    bool success = true;
     for (ITERATE_TILE_LIST(tile, coeff_list)) {
-        isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
+        success &= isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
     }
     for (ITERATE_TILE_LIST(tile, idwt_list)) {
-        isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
+        success &= isyntax_openslide_load_tile_coefficients(cache, isyntax, tile);
     }
     for (ITERATE_TILE_LIST(tile, idwt_list)) {
         if (tile == idwt_list.tail) {
@@ -428,4 +448,5 @@ void isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, in
     }
 
     platform_mutex_unlock(&cache->mutex);
+    return success;
 }
