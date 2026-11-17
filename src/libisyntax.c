@@ -54,7 +54,11 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include "libisyntax.h"
 #include "isyntax.h"
 #include "isyntax_reader.h"
@@ -158,9 +162,20 @@ isyntax_error_t libisyntax_open(const char* filename, enum libisyntax_open_flags
     }
 }
 
+// glibc keeps freed heap memory in the process once its dynamic mmap threshold has grown past the size of the
+// per-handle tables (a few MB to ~30 MB each): after opening, reading and closing 20 handles, 0.5-0.7 GB stayed
+// resident (0 bytes in use). Give it back on close; one pass over the free chunks, well under a millisecond per
+// 100 MB of heap. Other allocators (and tables above 32 MB, which glibc always mmaps) are unaffected.
+static void release_freed_heap_memory(void) {
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
 void libisyntax_close(isyntax_t* isyntax) {
     isyntax_destroy(isyntax);
     free(isyntax);
+    release_freed_heap_memory();
 }
 
 int32_t libisyntax_get_tile_width(const isyntax_t* isyntax) {
@@ -398,6 +413,7 @@ void libisyntax_cache_destroy(isyntax_cache_t* isyntax_cache) {
 
     platform_mutex_destroy(&isyntax_cache->mutex);
     free(isyntax_cache);
+    release_freed_heap_memory();
 }
 
 // TODO(pvalkema): should we allow passing a stride for the pixels_buffer, to allow blitting into buffers
