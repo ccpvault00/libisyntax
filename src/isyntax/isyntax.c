@@ -3353,8 +3353,13 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 					console_print_error("iSyntax: invalid number of levels (%d)\n", num_levels);
 					goto failed;
 				}
-				i64 grid_width_64 = ((i64)wsi_image->width_including_padding + (block_width << num_levels) - 1) / (block_width << num_levels) << (num_levels - 1);
-				i64 grid_height_64 = ((i64)wsi_image->height_including_padding + (block_height << num_levels) - 1) / (block_height << num_levels) << (num_levels - 1);
+				// The codeblock size comes from the header too; keep the divisions below defined and the shifts in range.
+				if (block_width <= 0 || block_height <= 0 || block_width > 4096 || block_height > 4096) {
+					console_print_error("iSyntax: unsupported codeblock size %d x %d\n", block_width, block_height);
+					goto failed;
+				}
+				i64 grid_width_64 = ((i64)wsi_image->width_including_padding + ((i64)block_width << num_levels) - 1) / ((i64)block_width << num_levels) << (num_levels - 1);
+				i64 grid_height_64 = ((i64)wsi_image->height_including_padding + ((i64)block_height << num_levels) - 1) / ((i64)block_height << num_levels) << (num_levels - 1);
 				// Tile coordinates are stored as u16 and tile counts as i32 (the header dimensions are file-controlled).
 				if (grid_width_64 <= 0 || grid_height_64 <= 0 || grid_width_64 > UINT16_MAX || grid_height_64 > UINT16_MAX ||
 				    grid_width_64 * grid_height_64 > INT32_MAX) {
