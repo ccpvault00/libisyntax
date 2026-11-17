@@ -3161,6 +3161,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 	ASSERT(isyntax);
 
 	isyntax->open_flags = flags;
+	isyntax->open_error = LIBISYNTAX_FATAL; // refined below: I/O problems set LIBISYNTAX_IO_ERROR
 
 	int ret = 0; (void)ret;
 	file_stream_t fp = file_stream_open_for_reading(filename);
@@ -3185,11 +3186,22 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 		if (isyntax->open_flags & LIBISYNTAX_OPEN_FLAG_READ_BARCODE_ONLY && isyntax->is_barcode_read) {
 			success = true; // Aborted early on purpose for fast barcode reading.
 		}
+		if (success) isyntax->open_error = LIBISYNTAX_OK;
 		return success;
+	}
+	if (!fp) {
+		console_print_error("iSyntax: could not open file %s\n", filename);
+		isyntax->open_error = LIBISYNTAX_IO_ERROR;
+		goto failed;
 	}
 
 	if (fp) {
 		i64 filesize = file_stream_get_filesize(fp);
+		if (filesize <= 0) {
+			console_print_error("iSyntax: could not determine the size of %s\n", filename);
+			isyntax->open_error = LIBISYNTAX_IO_ERROR;
+			goto failed;
+		}
 		if (filesize > 0) {
 			isyntax->filesize = filesize;
 
@@ -3214,6 +3226,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 			io_ticks_elapsed += (get_clock() - io_begin);
 
 			if (bytes_read < 3) {
+				isyntax->open_error = LIBISYNTAX_IO_ERROR;
 				goto failed;
 			}
 			bool are_there_bytes_left = (bytes_read == read_size);
@@ -3279,6 +3292,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 						continue;
 					} else {
 						console_print_error("iSyntax parsing error: didn't find the end of the XML header (unexpected end of file)\n");
+						isyntax->open_error = LIBISYNTAX_IO_ERROR;
 						goto failed;
 					}
 				}
@@ -3415,6 +3429,7 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 						seektable = (isyntax_seektable_codeblock_header_t*) malloc(seektable_size);
 						if (file_stream_read(seektable, seektable_size, fp) != seektable_size) {
 							console_print_error("iSyntax: unexpected end of file while reading the seektable\n");
+							isyntax->open_error = LIBISYNTAX_IO_ERROR;
 							goto failed;
 						}
 

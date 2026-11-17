@@ -25,9 +25,10 @@ typedef struct isyntax_cache_t {
 } isyntax_cache_t;
 
 // TODO(avirodov): can this ever fail?
-// Returns false if a codeblock needed for the tile could not be read or decoded (corrupt or truncated file).
-bool isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
-                       uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format);
+// Returns LIBISYNTAX_IO_ERROR if a codeblock needed for the tile could not be read (truncated file),
+// LIBISYNTAX_FATAL if one could not be decoded (corrupt data); zero coefficients stand in for the affected tiles.
+isyntax_error_t isyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* cache, int scale, int tile_x, int tile_y,
+                                  uint32_t* pixels_buffer, enum isyntax_pixel_format_t pixel_format);
 
 void tile_list_init(isyntax_tile_list_t* list, const char* dbg_name);
 void tile_list_remove(isyntax_tile_list_t* list, isyntax_tile_t* tile);

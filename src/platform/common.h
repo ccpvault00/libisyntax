@@ -253,10 +253,13 @@ FORCE_INLINE void libc_free(void* memory) {
 extern "C" {
 #endif
 #if !USE_CONSOLE_GUI
-#define console_print printf
-#define console_print_error(...) fprintf(stderr, __VA_ARGS__)
+// Diagnostics go through the process-wide log callback (libisyntax_set_log_callback()); silent by default.
+// Levels mirror enum libisyntax_log_level_t in libisyntax.h (kept numeric here to avoid the include).
+void isyntax_log(int level, const char* fmt, ...);
+#define console_print(...) isyntax_log(1 /*INFO*/, __VA_ARGS__)
+#define console_print_error(...) isyntax_log(3 /*ERROR*/, __VA_ARGS__)
 extern bool is_verbose_mode; // NOTE: necessary to define this variable somewhere
-#define console_print_verbose(...) do { if (is_verbose_mode) fprintf(stdout, __VA_ARGS__); } while(0)
+#define console_print_verbose(...) do { if (is_verbose_mode) isyntax_log(0 /*DEBUG*/, __VA_ARGS__); } while(0)
 #else
 void console_print(const char *fmt, ...); // defined in console.cpp
 void console_print_verbose(const char *fmt, ...); // defined in console.cpp

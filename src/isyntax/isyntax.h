@@ -270,7 +270,8 @@ typedef struct isyntax_tile_t {
     // Concurrency (isyntax_reader): all three are only touched with isyntax_cache_t.mutex held.
     int reader_refcount;        // threads whose working set contains this tile; > 0 keeps it out of the LRU list
     bool reader_in_progress;    // a thread is loading coefficients or running the IDWT for this tile (outside the lock)
-    bool reader_failed;         // its codeblocks could not be read/decoded (zero coefficients were substituted)
+    int8_t reader_error;        // isyntax_error_t: LIBISYNTAX_IO_ERROR (short read) or LIBISYNTAX_FATAL (undecodable);
+                                // zero coefficients were substituted for the affected codeblocks
 
     // Note(avirodov): this is needed for isyntax_reader. It is very convenient to be able to compute neighbors
     // from the tile itself, although at the cost of additional memory (3 ints) per tile.
@@ -376,6 +377,7 @@ typedef struct isyntax_xml_parser_t {
 typedef struct isyntax_t {
 	enum libisyntax_open_flags_t open_flags;
 	i64 filesize;
+	i32 open_error; // isyntax_error_t set by isyntax_open() on failure (LIBISYNTAX_IO_ERROR or LIBISYNTAX_FATAL)
 	file_handle_t file_handle;
 	isyntax_image_t images[16];
 	i32 image_count;
