@@ -3353,8 +3353,9 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 					console_print_error("iSyntax: invalid number of levels (%d)\n", num_levels);
 					goto failed;
 				}
-				// The codeblock size comes from the header too; keep the divisions below defined and the shifts in range.
-				if (block_width <= 0 || block_height <= 0 || block_width > 4096 || block_height > 4096) {
+				// The codeblock size comes from the header too; keep the divisions below defined, the shifts in range and the
+				// decoder's 4x4 / 8-pixel block assumptions valid.
+				if (block_width < 16 || block_height < 16 || block_width > 4096 || block_height > 4096 || (block_width % 16) != 0 || (block_height % 16) != 0) {
 					console_print_error("iSyntax: unsupported codeblock size %d x %d\n", block_width, block_height);
 					goto failed;
 				}
@@ -3414,8 +3415,8 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 					codeblock->x_adjusted = (i32)codeblock->x_coordinate - wsi_image->offset_x;
 					codeblock->y_adjusted = (i32)codeblock->y_coordinate - wsi_image->offset_y;
 
-					if (codeblock->scale >= (u32)num_levels || codeblock->color_component >= 3) {
-						console_print_error("iSyntax: codeblock %d has invalid scale %u or color component %u\n", i, codeblock->scale, codeblock->color_component);
+					if (codeblock->scale >= (u32)num_levels || codeblock->color_component >= 3 || codeblock->coefficient > 1) {
+						console_print_error("iSyntax: codeblock %d has invalid scale %u, color component %u or coefficient %u\n", i, codeblock->scale, codeblock->color_component, codeblock->coefficient);
 						goto failed;
 					}
 

@@ -110,22 +110,29 @@ static isyntax_error_t isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_
     isyntax_error_t result = LIBISYNTAX_OK;
 
     for (int color = 0; color < 3; ++color) {
-        isyntax_codeblock_t* codeblock = &wsi->codeblocks[codeblock_index + color * chunk->codeblock_count_per_color];
-        ASSERT(codeblock->coefficient == (is_ll ? 0 : 1)); // LL coefficient codeblock for this tile.
-        // TODO(avirodov): int vs i32 vs u32 consistently.
-        ASSERT(codeblock->color_component == (u32)color);
-        ASSERT(codeblock->scale == (u32)tile->tile_scale);
+        i64 index = (i64)codeblock_index + (i64)color * chunk->codeblock_count_per_color;
+        isyntax_codeblock_t* codeblock = index >= 0 && index < wsi->codeblock_count ? &wsi->codeblocks[index] : NULL;
         if (is_ll) {
             tile->color_channels[color].coeff_ll = (icoeff_t *) block_alloc(cache->ll_coeff_block_allocator);
         } else {
             tile->color_channels[color].coeff_h = (icoeff_t *) block_alloc(cache->h_coeff_block_allocator);
+        }
+        icoeff_t* out_buffer = is_ll ? tile->color_channels[color].coeff_ll : tile->color_channels[color].coeff_h;
+        // The output buffer holds 1 (LL) or 3 (LH/HL/HH) coefficient blocks; the decoder writes as many as the
+        // codeblock's own kind says, so a header that mislabels a block must not reach it.
+        if (!codeblock || codeblock->coefficient != (is_ll ? 0u : 1u) || codeblock->color_component != (u32)color ||
+            codeblock->scale != (u32)tile->tile_scale) {
+            console_print_error("Error: iSyntax codeblock table does not match tile (scale %d, %d,%d) color %d\n",
+                                tile->tile_scale, tile->tile_x, tile->tile_y, color);
+            memset(out_buffer, 0, (is_ll ? 1 : 3) * isyntax->block_width * isyntax->block_height * sizeof(icoeff_t));
+            if (result == LIBISYNTAX_OK) result = LIBISYNTAX_FATAL;
+            continue;
         }
         // TODO(avirodov): fancy allocators, for multiple sequential blocks (aka chunk). Or let OS do the caching.
         // Adding 7 safety bytes so bitstream_lsb_read() won't access out of bounds in isyntax_hulsken_decompress().
         // They are zero-initialised: the 64-bit reads at the end of the block pull them in (valgrind otherwise
         // reports uninitialised values; the decoded symbols never depend on them).
         u8* codeblock_data = calloc(codeblock->block_size + 7, 1);
-        icoeff_t* out_buffer = is_ll ? tile->color_channels[color].coeff_ll : tile->color_channels[color].coeff_h;
         size_t bytes_read = file_handle_read_at_offset(codeblock_data, isyntax->file_handle,
                                                        codeblock->block_data_offset, codeblock->block_size);
         if (bytes_read != codeblock->block_size) {
