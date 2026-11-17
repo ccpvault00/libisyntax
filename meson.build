@@ -84,6 +84,12 @@ pkg = import('pkgconfig')
 pkg.generate(isyntax)
 install_headers('src/libisyntax.h')
 
+# Consumers that pull libisyntax in as a Meson subproject (e.g. OpenSlide)
+# only need libisyntax_dep; skip the example programs and tests for them.
+if meson.is_subproject()
+  subdir_done()
+endif
+
 isyntax_example = executable(
   'isyntax_example',
   'src/examples/isyntax_example.c',
